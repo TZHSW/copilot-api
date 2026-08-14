@@ -26,17 +26,51 @@ bash deploy/install.sh
 
 | 步骤 | 动作 |
 |------|------|
-| 1 | 检查 node ≥ 20；没有就从 nodejs.org 抓官方 tarball 解到 `~/.local/share/node-vX` 并软链到 `~/.local/bin`（不需要 sudo，不依赖 nvm）|
+| 1 | 检查 node ≥ 20；没有就从 nodejs.org 抓官方 tarball 解到 `~/.local/share/node-vX`，软链到 `~/.local/bin`，并把该目录写进 `~/.profile` 和 `~/.bashrc`/`~/.zshrc`（不需要 sudo，不依赖 nvm）|
 | 2 | 拿产物：源码模式跑 `bun run build:standalone`；免构建包直接用自带 `dist/` |
 | 3 | 产物拷到 `~/.local/share/copilot-api-patched/dist/` |
 | 4 | 没有 github_token 就走设备码登录 |
-| 5 | 装 systemd user 服务并 `enable --now` + `enable-linger`，等端口就绪 |
+| 5 | 常驻：优先 systemd user 服务（`enable --now` + `enable-linger`）；没有用户 D-Bus 时退到 `copilot-api-ctl`（setsid + pidfile + crontab `@reboot`）|
 | 6 | 没有 `claude` 就跑官方安装脚本 |
 | 7 | 把 `settings.template.json` 合并进 `~/.claude/settings.json`（先备份） |
 | 8 | 查模型在不在目录里，再实发一次 `max_tokens=16` 的请求验证整条链路 |
 
 环境变量：`PORT`（默认 4141）、`CLAUDE_CONFIG_DIR`（默认 `~/.claude`）、
-`NODE_VERSION`（默认 22.22.3，仅在需要装 node 时用到）。
+`NODE_VERSION`（默认 22.22.3，仅在需要装 node 时用到）、
+`SUPERVISOR=nohup`（强制不用 systemd）。
+
+## node 环境到底需要什么
+
+这套部署**只要 node 运行时**：产物是自包含的，不用 npm 装任何依赖（npm/npx 只是
+跟着 tarball 一起来的）。脚本会配好三件事：
+
+- `~/.local/share/node-v<版本>/` 下的 node 本体，软链 `node`/`npm`/`npx` 到 `~/.local/bin`
+- `~/.profile` 里的 PATH——**ssh 进去是登录 shell，bash 登录只读 `.profile` 不读 `.bashrc`**，
+  所以两处都写（幂等，靠注释 marker 判重）
+- systemd unit 不依赖你的 shell：`ExecStart` 是 node 绝对路径，`Environment=PATH`
+  里也写死了 `~/.local/bin`。所以「服务能起来」和「你终端里能敲到 node」是两件事
+
+已经有 node ≥ 20 的机器完全不碰这些。
+
+## 没有 systemd user session 怎么办
+
+容器里、或者 `ssh`/`su` 进来没有登录会话时，`systemctl --user` 会报：
+
+```
+Failed to connect to bus: $DBUS_SESSION_BUS_ADDRESS and $XDG_RUNTIME_DIR not defined
+```
+
+脚本会先尝试自动补救（`/run/user/<uid>` 在的话就补上 `XDG_RUNTIME_DIR`，这能覆盖
+大部分「会话在、只是环境变量没带过来」的情况）；补不了就自动改用
+`~/.local/bin/copilot-api-ctl`：
+
+```bash
+copilot-api-ctl start|stop|restart|status|log
+```
+
+它用 setsid 起进程（终端关掉不受影响）、pidfile 记录、日志在
+`~/.local/share/copilot-api-patched/run.log`，并挂一条 crontab `@reboot` 做开机自启。
+没有 crontab 的机器会明确提示重启后要手动拉起。
 
 ## 打包
 
@@ -94,8 +128,11 @@ curl -s -H "Authorization: Bearer copilot-api" \
 
 | 现象 | 排查 |
 |------|------|
-| 反代起不来 | `journalctl --user -u copilot-api -n 50 --no-pager` |
-| 注销后服务没了 | `loginctl enable-linger $USER` 是否成功 |
+| `Failed to connect to bus: $DBUS_SESSION_BUS_ADDRESS ... not defined` | 没有用户 D-Bus，见上一节；脚本会自动退到 `copilot-api-ctl`。想跳过探测直接用它：`SUPERVISOR=nohup bash install.sh` |
+| 装完新终端里 `claude` / `node` 找不到 | `source ~/.profile`，或重新登录一次 |
+| 反代起不来（systemd） | `journalctl --user -u copilot-api -n 50 --no-pager` |
+| 反代起不来（nohup 模式） | `tail -50 ~/.local/share/copilot-api-patched/run.log` |
+| 注销后服务没了 | systemd 模式看 `loginctl enable-linger $USER`；nohup 模式看 crontab `@reboot` 在不在 |
 | 改了 settings 不生效 | `env` 只在进程启动时读，重开终端 |
 | `API Error: operation timed out` | 大请求时慢在反代→Copilot 那一跳，不是网络问题；可在 `env` 里加 `"API_TIMEOUT_MS": "600000"` |
 | 模型 400 | 该模型不支持请求里的 effort 档位；native 路径不做 clamp，会直接透传 Copilot 的报错 |
