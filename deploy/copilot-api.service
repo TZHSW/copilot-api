@@ -1,0 +1,28 @@
+[Unit]
+Description=GitHub Copilot API proxy (patched fork) — Claude Code -> Copilot Enterprise
+Documentation=https://github.com/TZHSW/copilot-api
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 跑的是本仓库 patched 分支构建出来的 bundle，补丁内容见 PATCH_NOTES.md。
+# 重新构建：bun install --frozen-lockfile && bun run build
+#           && cp dist/main.js dist/main.js.map @SHARE@/dist/ && systemctl --user restart copilot-api
+ExecStart=@NODE@ @SHARE@/dist/main.js start --account-type enterprise --port @PORT@
+Restart=always
+RestartSec=5
+
+# 日志走 journald：journalctl --user -u copilot-api -f
+StandardOutput=journal
+StandardError=journal
+
+# HOME 必须显式给：二进制靠它找 ~/.local/share/copilot-api/github_token
+#（那是 OAuth 凭证，和 copilot-api-patched/ 这个构建目录没关系）
+WorkingDirectory=@HOME@
+Environment=HOME=@HOME@
+Environment=PATH=@HOME@/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=CONSOLA_LEVEL=5
+
+[Install]
+WantedBy=default.target
