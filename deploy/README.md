@@ -33,7 +33,7 @@ bash deploy/install.sh
 | 5 | 常驻：优先 systemd user 服务（`enable --now` + `enable-linger`）；没有用户 D-Bus 时退到 `copilot-api-ctl`（setsid + pidfile + crontab `@reboot`）|
 | 6 | 没有 `claude` 就跑官方安装脚本 |
 | 7 | 把 `settings.template.json` 合并进 `~/.claude/settings.json`（先备份） |
-| 8 | 查模型在不在目录里，再实发一次 `max_tokens=16` 的请求验证整条链路 |
+| 8 | 逐字校验 settings 里的四个 `ANTHROPIC_*_MODEL` 是否都在反代的 `/v1/models` 里，再实发一次 `max_tokens=16` 的请求验证整条链路 |
 
 环境变量：`PORT`（默认 4141）、`CLAUDE_CONFIG_DIR`（默认 `~/.claude`）、
 `NODE_VERSION`（默认 22.22.3，仅在需要装 node 时用到）、
@@ -95,7 +95,7 @@ OUT_DIR=/tmp bash deploy/pack.sh
 
 - `env`：`ANTHROPIC_BASE_URL=http://localhost:4141/v1/native`、
   `ANTHROPIC_API_KEY=copilot-api`（本地反代不校验，占位）、
-  `ANTHROPIC_MODEL=claude-opus-5[1m]` 及三档默认模型
+  `ANTHROPIC_MODEL=claude-opus-5` 及三档默认模型（必须逐字等于反代 `/v1/models` 列出的 id）
 - `permissions`：174 条 Bash allowlist + `defaultMode: bypassPermissions`
 - `model: opus`、`effortLevel: high`、`theme`、`editorMode` 等偏好
 - `enabledPlugins`：superpowers、claude-hud（首次启动 Claude Code 自己拉）
@@ -110,14 +110,24 @@ OUT_DIR=/tmp bash deploy/pack.sh
 只翻译模型名，不走 Anthropic↔OpenAI 双向翻译，保真度最高。补丁细节见
 [PATCH_NOTES.md](../PATCH_NOTES.md)。
 
-## 模型目录会变
+## 模型名必须和反代逐字一致
 
-`claude-opus-4.7-1m-internal` 这个曾经的默认模型现在**已经从目录里消失**了。所以
-第 8 步会先列一遍目录再验证，模型不在时给出现有的 claude 型号让你改
-`deploy/settings.template.json` 里的 `ANTHROPIC_MODEL`。当前用的是 `claude-opus-5[1m]`
-（`[1m]` 后缀在 native 路径会被剥掉，目录里没有对应变体也能正常工作）。
+Claude Code 会拿 `settings.json` 里的模型名去和反代的 `/v1/models` 比对，对不上就是：
 
-随时手查：
+```
+There's an issue with the selected model (xxx). It may not exist or you may not have access to it.
+```
+
+**别写 `[1m]` 后缀**。补丁只对目录里 id 形如 `...-1m` / `...-1m-internal` 的型号生成
+`[1m]` 别名，而 Copilot 早已下架这类内部变体（`claude-opus-4.7-1m-internal` 曾是默认
+模型，现在整个消失了），所以列表里一个 `[1m]` 都没有。native 路径转发时会把 `[1m]`
+剥掉，于是 curl 直连照样能通——但 Claude Code 在校验那一步就先拦下了。
+
+上下文窗口不受影响：反代透传了 Copilot 的 capabilities，`claude-opus-5` 自己就写着
+`max_context_window_tokens: 1000000`。
+
+当前模板用的是 `claude-opus-5` / `claude-sonnet-5` / `claude-haiku-4-5`。目录随时会变，
+安装脚本第 8 步会逐字校验，对不上直接退出并列出可用 id。随时手查：
 
 ```bash
 curl -s -H "Authorization: Bearer copilot-api" \

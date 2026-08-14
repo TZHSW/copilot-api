@@ -292,20 +292,33 @@ PY
 
 # ---------------------------------------------------------------- 8. 验证
 say "验证"
-MODEL=$(python3 -c "import json;print(json.load(open('$SETTINGS'))['env']['ANTHROPIC_MODEL'])")
+# 反代实际服务哪些 id，settings 里就得写哪些——逐字比对，不做任何剥后缀之类的
+# 宽容处理。Claude Code 会拿 settings 里的模型名去和 /v1/models 对，对不上就报
+# "There's an issue with the selected model"。目录本身也会变（claude-opus-4.7-1m-internal
+# 就整个下架过），所以这一步失败就直接停，别把坏配置留给用户。
+if ! curl -s -m10 -H "Authorization: Bearer copilot-api" \
+      "http://localhost:$PORT/v1/native/v1/models" \
+   | SETTINGS="$SETTINGS" python3 -c "
+import sys, json, os
+served = {m['id'] for m in json.load(sys.stdin)['data']}
+env = json.load(open(os.environ['SETTINGS']))['env']
+keys = ['ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL',
+        'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL']
+bad = {k: env[k] for k in keys if k in env and env[k] not in served}
+for k in keys:
+    if k in env:
+        print(f\"  {'✓' if env[k] in served else '✗'} {k} = {env[k]}\")
+if bad:
+    print('\n反代没有提供这些模型 id。当前可用的 claude 型号：')
+    for i in sorted(i for i in served if i.startswith('claude')):
+        print('  ' + i)
+    print('\n改 settings.json 里的 env（或 deploy/settings.template.json）再重跑。')
+    sys.exit(1)
+"; then
+  die "模型名和反代对不上，见上面列表"
+fi
 
-# 模型目录会变（历史上 claude-opus-4.7-1m-internal 就整个下架过），先看它在不在
-curl -s -m10 -H "Authorization: Bearer copilot-api" "http://localhost:$PORT/v1/native/v1/models" \
-  | MODEL="$MODEL" python3 -c "
-import sys, json, os, re
-model = os.environ['MODEL']
-ids = [m['id'] for m in json.load(sys.stdin)['data']]
-base = re.sub(r'\[1m\]$', '', model)
-if base in ids or model in ids:
-    print(f'目录里有 {model}')
-else:
-    print(f'[warn] 目录里没有 {model}；现有 claude 型号：' + ', '.join(i for i in ids if i.startswith('claude')))
-"
+MODEL=$(python3 -c "import json;print(json.load(open('$SETTINGS'))['env']['ANTHROPIC_MODEL'])")
 
 RESP=$(curl -s -m 90 "http://localhost:$PORT/v1/native/v1/messages" \
   -H "Authorization: Bearer copilot-api" -H "anthropic-version: 2023-06-01" \
