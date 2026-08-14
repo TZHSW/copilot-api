@@ -156,7 +156,13 @@ function translateThinkingToReasoningEffort(
  * both of which 400 on Copilot — so every sub-agent / tool-routing
  * call silently failed before this patch.
  *
- * Translation table (verified against Copilot catalog 2026-06-03):
+ * Translation table (verified against Copilot catalog 2026-06-03) — HISTORICAL.
+ * The catalog has since dropped every -1m / -1m-internal variant (checked
+ * 2026-08-14: claude-opus-4.6/4.7/4.8/5, claude-sonnet-4.6/5, claude-haiku-4.5,
+ * nothing with a 1M suffix). The code below resolves variants from the live
+ * catalog rather than from this table, so it degrades to the base model on its
+ * own; the table is kept to show what the mapping looks like when the internal
+ * variants are present.
  *
  *   claude-opus-4-7[1m]    → claude-opus-4.7-1m-internal  (xhigh-capable)
  *   claude-opus-4-7        → claude-opus-4.7              (medium-only)
@@ -219,7 +225,8 @@ function translateModelName(model: string): string {
   // are natively 1M-context. Copilot splits them into a 200K base and a
   // separate 1M variant. Route bare names to the 1M variant so behavior
   // matches the official API. Falls back to base if no 1M variant exists.
-  if (!normalized.includes("-1m") && /^claude-opus-4\.\d+$/.test(normalized)) {
+  // Any major version, not just 4.x — opus 5 shipped after this was written.
+  if (!normalized.includes("-1m") && /^claude-opus-\d+\.\d+$/.test(normalized)) {
     return resolve1mVariant(normalized)
   }
 
