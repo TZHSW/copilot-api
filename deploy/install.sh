@@ -152,6 +152,40 @@ else
 fi
 
 # ---------------------------------------------------------------- 5. 常驻
+# 起之前先确认端口是空的。被别人占着的话我们的进程会 EADDRINUSE 当场死掉，而后面
+# 的健康检查会打在人家的服务上照样 200，最后表现成「装好了但连不上」——这是最容易
+# 误诊的一种失败，所以这里查三层：谁的 pid、是不是我们自己的旧实例、查不到 pid 时
+# 再用连接探测兜底（容器里 ss 常看不到别的进程）。
+port_pid() {
+  ss -ltnp 2>/dev/null | grep -E "[:.]$PORT[[:space:]]" \
+    | grep -oE 'pid=[0-9]+' | cut -d= -f2 | head -1
+}
+port_answers() { curl -sf --noproxy '*' -m2 "http://localhost:$PORT/" >/dev/null 2>&1; }
+wait_port_free() {
+  timeout 20 bash -c "until ! curl -sf --noproxy '*' -m2 http://localhost:$PORT/ >/dev/null 2>&1; do :; done"
+}
+
+BUSY_PID=$(port_pid || true)
+if [ -n "$BUSY_PID" ]; then
+  BUSY_CMD=$(tr '\0' ' ' < "/proc/$BUSY_PID/cmdline" 2>/dev/null || echo '?')
+  case "$BUSY_CMD" in
+    *"$SHARE"*)
+      echo "端口 $PORT 上是本机上次装的实例 (pid $BUSY_PID)，先停掉再重装"
+      kill "$BUSY_PID" 2>/dev/null || true
+      wait_port_free || die "旧实例 (pid $BUSY_PID) 停不掉，手动 kill 后重跑" ;;
+    *)
+      die "端口 $PORT 已被别的进程占用，我们的服务起不来（EADDRINUSE）：
+  pid = $BUSY_PID
+  cmd = $BUSY_CMD
+要么停掉它（kill $BUSY_PID），要么换端口重跑：PORT=$((PORT + 1)) bash install.sh
+（settings.json 里的 ANTHROPIC_BASE_URL 会跟着写成同一个端口）" ;;
+  esac
+elif port_answers; then
+  die "端口 $PORT 上已经有服务在应答，但查不到是哪个进程（容器里 ss 往往看不到别人的 pid）。
+我们的服务起上去会 EADDRINUSE 直接死。先确认那是什么，或换端口重跑：
+  PORT=$((PORT + 1)) bash install.sh"
+fi
+
 # 首选 systemd user 服务。容器、或者没有登录会话的 ssh/su 里没有用户 D-Bus，
 # 那就退到 nohup + pidfile 的 copilot-api-ctl。SUPERVISOR=nohup 可强制走后者。
 SUPERVISOR=${SUPERVISOR:-auto}
@@ -216,6 +250,15 @@ CTLEOF
   echo "已装 $CTL"
   "$CTL" restart
 
+  # 立刻验活：进程秒退（EADDRINUSE、token 失效之类）的话，直接把日志摆出来，
+  # 不要傻等 60 秒的端口轮询再报一个含糊的「没起来」。
+  timeout 10 bash -c "until [ -f '$SHARE/run.pid' ]; do :; done" || true
+  if ! "$CTL" status >/dev/null 2>&1; then
+    warn "服务起来后立刻退出了，日志末尾："
+    tail -30 "$SHARE/run.log" 2>/dev/null
+    die "服务没能常驻，看上面日志"
+  fi
+
   # 开机自启：有 crontab 就挂 @reboot，没有就明说不会自启
   if command -v crontab >/dev/null 2>&1; then
     CRON_LINE="@reboot $CTL start"
@@ -234,12 +277,29 @@ CTLEOF
 fi
 
 say "等端口 $PORT"
-if timeout 60 bash -c "until curl -sf -m2 http://localhost:$PORT/ >/dev/null 2>&1; do :; done"; then
-  echo "反代就绪：http://localhost:$PORT"
+if timeout 60 bash -c "until curl -sf --noproxy "*" -m2 http://localhost:$PORT/ >/dev/null 2>&1; do :; done"; then
+  echo "端口有应答：http://localhost:$PORT"
 else
   eval "$LOGHINT" || true
   die "反代没起来，看上面日志"
 fi
+
+# 有应答 ≠ 是我们。拉一次模型目录确认，顺便把结果留给第 8 步用，避免重复请求。
+MODELS_BODY=$(curl -s --noproxy "*" -m20 -H "Authorization: Bearer copilot-api" \
+  "http://localhost:$PORT/v1/native/v1/models" || true)
+if ! printf '%s' "$MODELS_BODY" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+sys.exit(0 if isinstance(d.get('data'), list) and d['data'] else 1)
+" 2>/dev/null; then
+  warn "端口 $PORT 有东西在应答，但 /v1/native/v1/models 不是正常的模型列表。"
+  warn "返回的前 300 字节："
+  printf '%s\n' "$MODELS_BODY" | head -c 300; echo
+  warn "常见原因：这个端口上跑的是别的服务；或 github_token 失效/无 Copilot Enterprise 权限；或容器出不去外网（需要 http_proxy）。"
+  eval "$LOGHINT" || true
+  die "反代不可用"
+fi
+echo "反代就绪，模型目录 $(printf '%s' "$MODELS_BODY" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["data"]))') 个型号"
 
 # ---------------------------------------------------------------- 6. Claude Code
 say "检查 Claude Code"
@@ -296,8 +356,7 @@ say "验证"
 # 宽容处理。Claude Code 会拿 settings 里的模型名去和 /v1/models 对，对不上就报
 # "There's an issue with the selected model"。目录本身也会变（claude-opus-4.7-1m-internal
 # 就整个下架过），所以这一步失败就直接停，别把坏配置留给用户。
-if ! curl -s -m10 -H "Authorization: Bearer copilot-api" \
-      "http://localhost:$PORT/v1/native/v1/models" \
+if ! printf '%s' "$MODELS_BODY" \
    | SETTINGS="$SETTINGS" python3 -c "
 import sys, json, os
 served = {m['id'] for m in json.load(sys.stdin)['data']}
@@ -320,7 +379,7 @@ fi
 
 MODEL=$(python3 -c "import json;print(json.load(open('$SETTINGS'))['env']['ANTHROPIC_MODEL'])")
 
-RESP=$(curl -s -m 90 "http://localhost:$PORT/v1/native/v1/messages" \
+RESP=$(curl -s --noproxy "*" -m 90 "http://localhost:$PORT/v1/native/v1/messages" \
   -H "Authorization: Bearer copilot-api" -H "anthropic-version: 2023-06-01" \
   -H "content-type: application/json" \
   -d "{\"model\":\"$MODEL\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"say OK\"}]}")

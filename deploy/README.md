@@ -146,3 +146,21 @@ curl -s -H "Authorization: Bearer copilot-api" \
 | 改了 settings 不生效 | `env` 只在进程启动时读，重开终端 |
 | `API Error: operation timed out` | 大请求时慢在反代→Copilot 那一跳，不是网络问题；可在 `env` 里加 `"API_TIMEOUT_MS": "600000"` |
 | 模型 400 | 该模型不支持请求里的 effort 档位；native 路径不做 clamp，会直接透传 Copilot 的报错 |
+
+## 端口被占用
+
+最容易误诊的一种：4141 上已经有别的服务，我们的进程一起来就
+`EADDRINUSE: address already in use :::4141` 当场死掉，而健康检查打在人家身上照样
+200，于是看起来「装好了」，实际 Claude Code 连的是那个陌生服务，取模型目录时拿回
+一坨不是 JSON 的东西。
+
+脚本现在起服务前会先查三层：`ss` 里的 pid、是不是本机上次装的旧实例（是就先停掉）、
+以及查不到 pid 时的连接探测兜底。占用方不是我们的话直接退出并给出：
+
+```
+kill <pid>                       # 停掉占用方
+PORT=4142 bash install.sh        # 或者换端口，settings 会跟着写成同一个端口
+```
+
+起完还会再确认「应答的确实是我们」——拉一次 `/v1/native/v1/models`，不是正常模型
+列表就打印返回的前 300 字节并退出，而不是把坏配置留下。

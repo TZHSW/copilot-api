@@ -36,9 +36,9 @@ mkdir -p "$STAGE/$NAME"
 
 say "组装 $NAME"
 cp -a dist-standalone "$STAGE/$NAME/dist"
-cp deploy/install.sh deploy/copilot-api.service deploy/settings.template.json \
+cp deploy/install.sh deploy/diagnose.sh deploy/copilot-api.service deploy/settings.template.json \
    deploy/README.md "$STAGE/$NAME/"
-chmod +x "$STAGE/$NAME/install.sh"
+chmod +x "$STAGE/$NAME/install.sh" "$STAGE/$NAME/diagnose.sh"
 
 cat > "$STAGE/$NAME/VERSION" <<EOF
 copilot-api patched — 免构建部署包
