@@ -1,5 +1,17 @@
 # 新机器一键部署
 
+两种装法，最后效果一样。
+
+**A. 免构建包**（推荐，目标机器什么都不用有）：
+
+```bash
+tar xzf copilot-cc-<日期>-<sha>.tar.gz
+cd copilot-cc-<日期>-<sha>
+bash install.sh
+```
+
+**B. 从源码**：
+
 ```bash
 git clone -b patched git@github.com:TZHSW/copilot-api.git
 cd copilot-api
@@ -14,16 +26,33 @@ bash deploy/install.sh
 
 | 步骤 | 动作 |
 |------|------|
-| 1 | 检查 node ≥ 20，没有就 nvm 装（不需要 sudo）；确认有 systemd user session |
-| 2 | 检查 bun（只用于构建；运行时是 node） |
-| 3 | `bun install --frozen-lockfile && bun run build`，产物拷到 `~/.local/share/copilot-api-patched/dist/` |
+| 1 | 检查 node ≥ 20；没有就从 nodejs.org 抓官方 tarball 解到 `~/.local/share/node-vX` 并软链到 `~/.local/bin`（不需要 sudo，不依赖 nvm）|
+| 2 | 拿产物：源码模式跑 `bun run build:standalone`；免构建包直接用自带 `dist/` |
+| 3 | 产物拷到 `~/.local/share/copilot-api-patched/dist/` |
 | 4 | 没有 github_token 就走设备码登录 |
 | 5 | 装 systemd user 服务并 `enable --now` + `enable-linger`，等端口就绪 |
 | 6 | 没有 `claude` 就跑官方安装脚本 |
-| 7 | 把 `deploy/settings.template.json` 合并进 `~/.claude/settings.json`（先备份） |
+| 7 | 把 `settings.template.json` 合并进 `~/.claude/settings.json`（先备份） |
 | 8 | 查模型在不在目录里，再实发一次 `max_tokens=16` 的请求验证整条链路 |
 
-环境变量：`PORT`（默认 4141）、`CLAUDE_CONFIG_DIR`（默认 `~/.claude`）。
+环境变量：`PORT`（默认 4141）、`CLAUDE_CONFIG_DIR`（默认 `~/.claude`）、
+`NODE_VERSION`（默认 22.22.3，仅在需要装 node 时用到）。
+
+## 打包
+
+```bash
+bash deploy/pack.sh              # 产物落在仓库根目录
+OUT_DIR=/tmp bash deploy/pack.sh
+```
+
+产出 `copilot-cc-<日期>-<sha>.tar.gz`（约 2.2 MB），里面是 `dist/`、`install.sh`、
+`copilot-api.service`、`settings.template.json`、`README.md`、`VERSION`。
+
+包里的 `dist/` 是 **noExternal 自包含构建**（`tsdown.pack.config.ts`，约 6 MB 解压后，
+含 gpt-tokenizer 的数据 chunk），目标机器不需要 `node_modules`、不需要 bun、不需要
+联网装依赖。注意默认的 `bun run build` 产物**不是**自包含的（依赖留在
+`node_modules`），单独拷走会 `ERR_MODULE_NOT_FOUND`——所以部署走的是
+`build:standalone`。
 
 ## settings 模板里有什么
 

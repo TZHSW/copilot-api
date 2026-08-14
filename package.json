@@ -23,6 +23,7 @@
   ],
   "scripts": {
     "build": "tsdown",
+    "build:standalone": "tsdown --config tsdown.pack.config.ts",
     "dev": "bun run --watch ./src/main.ts",
     "knip": "knip-bun",
     "lint": "eslint --cache",

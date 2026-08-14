@@ -12,3 +12,7 @@ node_modules/
 
 # build output
 dist/
+dist-standalone/
+
+# deploy tarballs
+copilot-cc-*.tar.gz
