@@ -28,6 +28,11 @@ interface ModelSupports {
   tool_calls?: boolean
   parallel_tool_calls?: boolean
   dimensions?: boolean
+  // Copilot catalog fields the translation layer keys off. Present on the
+  // Anthropic models (verified against /v1/models on 2026-08-14); absent on
+  // e.g. claude-haiku-4-5, which is exactly what the checks test for.
+  reasoning_effort?: Array<string>
+  structured_outputs?: boolean
 }
 
 interface ModelCapabilities {

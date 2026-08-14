@@ -32,17 +32,31 @@ export async function handleNativeMessages(c: Context) {
   delete payload.context_management
   delete payload.service_tier
 
-  // Strip thinking/effort for models that don't support them (e.g. haiku).
+  // Strip fields per model capability, each keyed on its OWN capability.
+  // Effort knobs (thinking, output_config.effort) go when the model has no
+  // reasoning_effort; the json_schema in output_config.format goes when the
+  // model doesn't declare structured_outputs. Dropping the whole
+  // output_config on the reasoning check alone would take the schema with
+  // it and silently degrade structured output to prose.
+  //
   // Models that support effort but reject the specific level (e.g. sonnet 4.6
   // doesn't support xhigh) will get Copilot's native 400 error — no clamping.
   if (typeof payload.model === "string") {
     const model = state.models?.data.find((m) => m.id === payload.model)
-    const supports = (model?.capabilities as Record<string, unknown>)?.supports as
+    const supports = model?.capabilities.supports
+    const outputConfig = payload.output_config as
       | Record<string, unknown>
       | undefined
+
     if (!Array.isArray(supports?.reasoning_effort)) {
-      delete payload.output_config
       delete payload.thinking
+      if (outputConfig) delete outputConfig.effort
+    }
+    if (supports?.structured_outputs !== true && outputConfig) {
+      delete outputConfig.format
+    }
+    if (outputConfig && Object.keys(outputConfig).length === 0) {
+      delete payload.output_config
     }
   }
 

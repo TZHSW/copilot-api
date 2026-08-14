@@ -52,6 +52,17 @@ export function translateToOpenAI(
 }
 
 /**
+ * Structured output (Anthropic `output_config.format` with a json_schema) is
+ * NOT translated here on purpose. Copilot's /chat/completions silently
+ * ignores `response_format` on the Anthropic models — probed 2026-08-14 on
+ * claude-opus-5 with json_schema+strict, json_schema, and json_object: all
+ * three came back as prose with a 200, indistinguishable from sending
+ * nothing. Copilot only honors the schema on its own /v1/messages endpoint,
+ * which is what the /v1/native route forwards to. Callers that need schema
+ * adherence must use /v1/native.
+ */
+
+/**
  * Translate Anthropic's thinking/effort fields into Copilot's reasoning
  * fields. Only emits fields if the target model supports reasoning.
  *
@@ -185,10 +196,7 @@ function catalogHasModel(id: string): boolean {
 // Check if the translated model supports reasoning_effort via catalog capabilities.
 function modelSupportsReasoning(translatedModel: string): boolean {
   const model = state.models?.data.find((m) => m.id === translatedModel)
-  const re = (model?.capabilities as Record<string, unknown>)?.supports as
-    | Record<string, unknown>
-    | undefined
-  return Array.isArray(re?.reasoning_effort)
+  return Array.isArray(model?.capabilities.supports.reasoning_effort)
 }
 
 // Try to find the 1M variant of a model in the catalog.
