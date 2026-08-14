@@ -81,6 +81,15 @@ interface Delta {
       arguments?: string
     }
   }>
+
+  // Copilot-specific extension: chain-of-thought (CoT) chunks for reasoning
+  // models. Streamed alongside `content` deltas. We surface them as
+  // Anthropic `thinking_delta` events in the stream translator and as
+  // a `thinking` content block in the non-stream translator. Without
+  // this, Copilot's reasoning output is silently dropped because the
+  // base translator only extracts `content` deltas.
+  reasoning_text?: string | null
+  reasoning_opaque?: string | null
 }
 
 interface Choice {
@@ -113,6 +122,16 @@ interface ResponseMessage {
   role: "assistant"
   content: string | null
   tool_calls?: Array<ToolCall>
+
+  // Copilot-specific extension: chain-of-thought (CoT) for reasoning
+  // models. Present on non-streaming responses when the model emits
+  // a reasoning summary. `reasoning_text` is human-readable; the
+  // matching `reasoning_opaque` is a token-bound signature Anthropic
+  // clients can use to chain follow-up turns with cached thinking
+  // state (see Anthropic API: extended thinking signature). We surface
+  // these as an Anthropic `thinking` content block in translateToAnthropic.
+  reasoning_text?: string | null
+  reasoning_opaque?: string | null
 }
 
 interface ChoiceNonStreaming {
@@ -148,6 +167,16 @@ export interface ChatCompletionsPayload {
     | { type: "function"; function: { name: string } }
     | null
   user?: string | null
+
+  // Copilot-specific extension: per-model reasoning effort tier. Catalog
+  // exposes which values are accepted per model via `/models`. For
+  // Anthropic models, only `claude-opus-4.7-1m-internal` accepts the
+  // full set [low, medium, high, xhigh]; plain 4.7 and 4.8 currently
+  // clamp to ["medium"] only. We translate from Anthropic's `thinking`
+  // field (see non-stream-translation.ts) and pass-through here.
+  reasoning_effort?: "low" | "medium" | "high" | "xhigh" | null
+  reasoning?: { effort: string } | null
+  thinking?: { type: string; budget_tokens?: number } | null
 }
 
 export interface Tool {

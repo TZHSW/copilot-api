@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "qid (local patch)" <xiaohanzhaoclaude@gmail.com>
+Date: Wed, 3 Jun 2026 05:18:06 +0000
+Subject: [PATCH] local patch 3: fix translateModelName for hyphen/[1m] forms
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Upstream copilot-api 0.7.0's translateModelName() collapses
+`claude-opus-4-N` (hyphen form) and `claude-opus-4-N[1m]` (1M variant)
+to bare `claude-opus-4`, which Copilot has never had in its catalog —
+so every sub-agent / tool-routing call from Claude Code that uses the
+hyphen form silently 400s with "model_not_supported", causing exit=1
+on otherwise-correct sessions.
+
+This rewrites the function with explicit hyphen→dot translation plus a
+small `[1m]` suffix → 1M-variant mapping:
+
+  claude-opus-4-7[1m]   → claude-opus-4.7-1m-internal   (xhigh-capable)
+  claude-opus-4-7       → claude-opus-4.7               (medium-only)
+  claude-opus-4-8[1m]   → claude-opus-4.7-1m-internal   (fallback; 4.8-1m not in Copilot catalog as of 2026-06-03)
+  claude-opus-4-8       → claude-opus-4.8               (medium-only)
+  claude-opus-4-6[1m]   → claude-opus-4.6-1m
+  claude-opus-4-6       → claude-opus-4.6
+  claude-sonnet-4-6[…]  → claude-sonnet-4.6             (no sonnet 1M on Copilot)
+  claude-haiku-4-5      → claude-haiku-4.5
+  (already-dotted ids pass through unchanged — daemons unaffected)
+
+Two practical wins:
+
+1. Claude Code can be invoked with `--model claude-opus-4-7[1m]` and
+   client-side autocompact recognizes it as a 1M model — effectiveWindow
+   jumps from 180000 (200K default - 20K headroom) to 480000 (1M -
+   520K headroom). 2.7× more raw dialogue history before compaction
+   triggers; matters on long PR-review / ultracode workflows.
+
+2. Sub-agent dispatches that use bare hyphenated forms (`claude-opus-4-7`)
+   now correctly land at `claude-opus-4.7` upstream instead of 400'ing.
+   This zeroes out the residual 400-error noise we'd been tolerating
+   via Claude Code's retry layer.
+
+Verified 2026-06-03: dual regression+forward test with both old wrapper
+(`claude-opus-4.7-1m-internal` dotted) and new wrapper
+(`claude-opus-4-7[1m]` hyphen-bracket) — both pass cleanly, 0 errors.
+Proxy receives correctly-translated ids in both directions.
+
+The wrapper at ~/.local/bin/claude-copilot is updated separately to use
+the new `claude-opus-4-7[1m]` default. Per-model clamp table in
+translateThinkingToReasoningEffort still keys on dotted ids
+(post-translation) so it works correctly through the new flow.
+---
+ src/routes/messages/non-stream-translation.ts | 62 +++++++++++++++++--
+ 1 file changed, 56 insertions(+), 6 deletions(-)
+
+diff --git a/src/routes/messages/non-stream-translation.ts b/src/routes/messages/non-stream-translation.ts
+index 9731df2..c7ef454 100644
+--- a/src/routes/messages/non-stream-translation.ts
++++ b/src/routes/messages/non-stream-translation.ts
+@@ -116,14 +116,64 @@ function translateThinkingToReasoningEffort(
+   return supported[0] ?? "medium"
+ }
+ 
++/**
++ * Translate the model id from Claude-Code-internal hyphenated form
++ * (e.g. `claude-opus-4-7`, `claude-opus-4-7[1m]`) into the Copilot
++ * Enterprise catalog form (dotted, plus Microsoft-internal 1m variant).
++ *
++ * Background: Claude Code's internal model registry uses hyphenated ids
++ * (`claude-opus-4-7`, `claude-sonnet-4-6`) for sub-agent dispatch, tool
++ * routing, and the `[1m]` syntactic-suffix for 1M-context variants
++ * (`claude-opus-4-7[1m]`, `claude-opus-4-6[1m]`). The Copilot Enterprise
++ * catalog uses DOTTED ids (`claude-opus-4.7`, `claude-opus-4.6`,
++ * `claude-opus-4.7-1m-internal`). The original upstream copilot-api
++ * 0.7.0 translation collapses every hyphenated opus to bare
++ * `claude-opus-4` and every hyphenated sonnet to `claude-sonnet-4`,
++ * both of which 400 on Copilot — so every sub-agent / tool-routing
++ * call silently failed before this patch.
++ *
++ * Translation table (verified against Copilot catalog 2026-06-03):
++ *
++ *   claude-opus-4-7[1m]    → claude-opus-4.7-1m-internal  (xhigh-capable)
++ *   claude-opus-4-7        → claude-opus-4.7              (medium-only)
++ *   claude-opus-4-8[1m]    → claude-opus-4.7-1m-internal  (no 4.8 1M yet, use 4.7-1m)
++ *   claude-opus-4-8        → claude-opus-4.8              (medium-only)
++ *   claude-opus-4-6[1m]    → claude-opus-4.6-1m
++ *   claude-opus-4-6        → claude-opus-4.6
++ *   claude-opus-4-5[…]     → claude-opus-4.5              (no effort spectrum)
++ *   claude-sonnet-4-6[…]   → claude-sonnet-4.6            (no 1M sonnet on Copilot)
++ *   claude-sonnet-4-5      → claude-sonnet-4.5
++ *   claude-haiku-4-5       → claude-haiku-4.5             (catalog has it, no effort)
++ *
++ * Pass-through: anything already in dotted form (`claude-opus-4.7-1m-internal`,
++ * `claude-opus-4.8`, `gpt-5.5`, etc.) is returned unchanged.
++ */
+ function translateModelName(model: string): string {
+-  // Subagent requests use a specific model number which Copilot doesn't support
+-  if (model.startsWith("claude-sonnet-4-")) {
+-    return model.replace(/^claude-sonnet-4-.*/, "claude-sonnet-4")
+-  } else if (model.startsWith("claude-opus-")) {
+-    return model.replace(/^claude-opus-4-.*/, "claude-opus-4")
++  // Detect and strip the `[1m]` Claude-Code 1M-context suffix.
++  const has1m = model.endsWith("[1m]")
++  const base = has1m ? model.slice(0, -"[1m]".length) : model
++
++  // Hyphen → dot for `claude-{family}-4-N` patterns. Only the SECOND
++  // hyphen (between major and minor version) becomes a dot; the
++  // `claude-{family}-` prefix and any trailing tokens stay as-is.
++  const dotted = base.replace(
++    /^(claude-(?:opus|sonnet|haiku)-(\d+))-(\d+)/,
++    "$1.$3",
++  )
++
++  if (!has1m) return dotted
++
++  // 1M-suffix forms: map to Copilot's 1M variants.
++  // Only Opus 4.6 and 4.7 have explicit 1M variants on Copilot;
++  // 4.8 has no 1M yet (2026-06-03 snapshot), so we fall back to
++  // 4.7-1m-internal (xhigh-capable) as the closest 1M Opus.
++  if (dotted === "claude-opus-4.7" || dotted === "claude-opus-4.8") {
++    return "claude-opus-4.7-1m-internal"
+   }
+-  return model
++  if (dotted === "claude-opus-4.6") return "claude-opus-4.6-1m"
++  // For sonnet and other families: no 1M variant exists; degrade to
++  // the non-1m form rather than 400'ing.
++  return dotted
+ }
+ 
+ function translateAnthropicMessagesToOpenAI(
+-- 
+2.25.1
+

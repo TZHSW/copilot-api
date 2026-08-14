@@ -1,0 +1,182 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "qid (local patch)" <xiaohanzhaoclaude@gmail.com>
+Date: Wed, 3 Jun 2026 06:26:54 +0000
+Subject: [PATCH] docs: append patch 4 chapter to PATCH_NOTES.md
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Covers the doc-driven investigation that revealed (a) Anthropic
+deprecated thinking.budget_tokens for Opus 4.7+ (so patch 1 was
+handling the wrong field), (b) Claude Code only emits output_config.effort
+when the model is recognized as supporting it (needed the
+_SUPPORTED_CAPABILITIES env var), and (c) modelOverrides doesn't apply
+to LLM-gateway paths so model translation must happen proxy-side.
+
+Documents the wrapper env-var stack:
+  ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7[1m]
+  ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES=effort,xhigh_effort,...
+  CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80
+  --model opus
+
+Includes the end-to-end wire-format verification dump showing
+output_config.effort:xhigh → reasoning_effort:xhigh translation
+working, with claude-opus-4-7 → claude-opus-4.7-1m-internal upstream.
+---
+ PATCH_NOTES.md | 143 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 143 insertions(+)
+
+diff --git a/PATCH_NOTES.md b/PATCH_NOTES.md
+index c260fac..5fcffb2 100644
+--- a/PATCH_NOTES.md
++++ b/PATCH_NOTES.md
+@@ -868,3 +868,146 @@ Empirically (2026-06-03) we haven't seen this 400 in practice — likely
+ because sub-agent calls don't include a `thinking` field anyway. But
+ the clamp ordering bug is a latent footgun. Fix tracked but not
+ currently impacting normal usage.
++
++---
++
++## Patch 4 (2026-06-03, late afternoon): `output_config.effort` translation + bare-hyphen → 1m-internal
++
++After patch 3 a major discrepancy was found: despite all wrapper config
++(`effortLevel: xhigh`, `alwaysThinkingEnabled: true`, `--effort xhigh`),
++the proxy was receiving requests with NO `thinking` field AND NO `effort`
++field. So our patch 1 (thinking → reasoning_effort) never fired — every
++Copilot request defaulted to `defaultReasoningEffort: medium`.
++
++Root cause (doc-driven investigation 2026-06-03):
++
++1. **Anthropic deprecated `thinking.budget_tokens` for 4.6+**, removed
++   entirely on 4.7/4.8. The new wire format is `thinking: {type: "adaptive"}`
++   + `output_config: {effort: "xhigh"}`. Patch 1 was handling the wrong
++   field for our models.
++
++2. **Claude Code emits the new fields only when the model is recognized**
++   as supporting adaptive_thinking + effort. The Microsoft-internal
++   `claude-opus-4.7-1m-internal` id wasn't in Claude Code's built-in
++   pattern table, so capability detection silently failed.
++
++3. **`modelOverrides` setting doesn't apply to LLM-gateway paths**:
++   > "Values you supply directly through `ANTHROPIC_MODEL`, `--model`, or
++   > the `ANTHROPIC_DEFAULT_*_MODEL` environment variables are passed to
++   > the provider as-is and are not transformed by `modelOverrides`."
++   So we can't use modelOverrides to remap `claude-opus-4-7` →
++   `claude-opus-4.7-1m-internal` at the Claude Code layer — must do it
++   in the proxy.
++
++### What patch 4 does
++
++**File: `src/routes/messages/anthropic-types.ts`**
++
++Extended `AnthropicMessagesPayload`:
++- `thinking.type` now accepts `"enabled" | "adaptive" | "disabled"`
++  (was just `"enabled"`).
++- New `output_config: { effort?: "low" | "medium" | "high" | "xhigh" | "max" }`
++  field per [Anthropic effort docs](https://platform.claude.com/docs/en/build-with-claude/effort).
++
++**File: `src/routes/messages/non-stream-translation.ts`**
++
++Two changes:
++
++1. **New `translateOutputConfigEffort()`**: reads `payload.output_config.effort`,
++   maps to Copilot's `reasoning_effort` field, clamps via the same per-model
++   allowlist as the legacy thinking-budget translation. `max` collapses to
++   `xhigh` (Copilot doesn't expose `max`). Takes precedence over legacy
++   `thinking.budget_tokens` translation.
++
++2. **Updated `translateModelName()`**: bare hyphenated `claude-opus-4-7`
++   (which Claude Code emits when wrapper resolves `opus` alias via
++   ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7[1m] — `[1m]` is stripped
++   client-side before send) now maps to `claude-opus-4.7-1m-internal`
++   instead of base `claude-opus-4.7`. The 1m-internal variant is strictly
++   better (1M context + full effort spectrum vs base's 200K + medium-only).
++   Same for `claude-opus-4-8`. Already-dotted forms still pass through
++   unchanged so PR daemons (passing `claude-opus-4.7-1m-internal` literally)
++   are unaffected.
++
++**File: `src/routes/messages/handler.ts`**
++
++Added optional `COPILOT_API_DUMP_PAYLOADS=1` env var that writes every
++incoming and outgoing payload to `/tmp/copilot-api-payloads.jsonl` as
++NDJSON. Bypasses journald's 48KB line-truncation. Useful for diagnosing
++unexpected wire shapes during config changes. Off by default — file
++grows unbounded if left on.
++
++### Wrapper-side changes (2026-06-03 — paired with patch 4)
++
++`~/.local/bin/claude-copilot`:
++
++- `COPILOT_MODEL` default changed from literal id to `opus` alias.
++- New env vars set by the wrapper:
++  - `ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7[1m]` — Claude Code's
++    1M-context-recognized syntax. The `[1m]` suffix triggers 1M-mode
++    autocompact threshold computation (effectiveWindow grows from 180K).
++  - `ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES='effort,xhigh_effort,thinking,adaptive_thinking,interleaved_thinking'`
++    — declares to Claude Code which features the model supports, so it
++    actually emits `output_config.effort` and `thinking: {type: "adaptive"}`
++    in API requests.
++  - `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80` — drops autocompact threshold
++    from default ~95% to 80% of perceived window. (Per issue #43989, this
++    var is capped by Math.min to ~83%, so 80 is the safe ceiling.)
++
++### Wire-format verification (2026-06-03, end-to-end test)
++
++Using the proxy's `COPILOT_API_DUMP_PAYLOADS=1` diagnostic mode:
++
++```
++[in-anthropic]
++  model: "claude-opus-4-7"          ← Claude Code stripped [1m]
++  thinking: {"type": "adaptive"}
++  output_config: {"effort": "xhigh"}
++
++[out-openai]
++  model: "claude-opus-4.7-1m-internal"   ← patch 4 routes hyphen → 1m-internal
++  thinking: ABSENT                        ← stripped (not Copilot-compatible)
++  output_config: ABSENT                   ← stripped (translated below)
++  reasoning_effort: "xhigh"               ← patch 4 translated output_config.effort
++```
++
++Zero HTTP 400 errors on a comprehensive workflow + Explore-copilot session.
++PR daemons (which use dotted `claude-opus-4.7-1m-internal` literal) are
++unaffected — dotted forms pass through unchanged.
++
++### Sub-agent uniformity
++
++A welcome side effect of the bare-hyphen → 1m-internal mapping: sub-agent
++dispatches that previously dropped to base 4.7 now also land on
++1m-internal. Workflow / Agent tool invocations that internally use
++`claude-opus-4-7` get the same capability profile as the main chat:
++1M context, xhigh effort.
++
++### Final effective capability (Copilot path via claude-copilot wrapper, 2026-06-03)
++
++| Dimension | Achieved |
++|---|---|
++| Server-side model | claude-opus-4.7-1m-internal (1M context, xhigh-capable) |
++| Server-side effort | **xhigh** (via reasoning_effort field, confirmed in wire dump) |
++| Server-side max thinking budget | 32K tokens (Copilot catalog cap; half of Anthropic native 64K) |
++| Client-side autocompact threshold | Set via 80% override + `[1m]` recognition |
++| CoT visibility | Anthropic `thinking` content blocks (via patch 2's reasoning_text → thinking translation) |
++| Sub-agent capability | Same as main chat (1m-internal + xhigh-eligible) |
++| Daemon impact | Zero (dotted form pass-through) |
++
++### Maintenance reminders
++
++- When Microsoft ships `claude-opus-4.8-1m-internal` to Copilot catalog,
++  update the `claude-opus-4-8[1m]` → ... mapping (currently falls back
++  to 4.7-1m-internal) and consider switching wrapper's
++  ANTHROPIC_DEFAULT_OPUS_MODEL to `claude-opus-4-8[1m]`.
++
++- If Anthropic changes the effort field schema again (e.g., renames
++  `output_config.effort` or adds new tier), update
++  `translateOutputConfigEffort` and the `Anthropic*.thinking.type` union
++  in `anthropic-types.ts`.
++
++- The diagnostic dump at `/tmp/copilot-api-payloads.jsonl` is invaluable
++  for verifying wire shape — keep `COPILOT_API_DUMP_PAYLOADS=1` env var
++  in your toolkit when investigating any future config-vs-reality
++  discrepancy.
+-- 
+2.25.1
+

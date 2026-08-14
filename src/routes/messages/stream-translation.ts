@@ -57,15 +57,69 @@ export function translateChunkToAnthropicEvents(
     state.messageStartSent = true
   }
 
-  if (delta.content) {
-    if (isToolBlockOpen(state)) {
-      // A tool block was open, so close it before starting a text block.
+  // Copilot reasoning models stream chain-of-thought in `reasoning_text`
+  // deltas (and an opaque signature in `reasoning_opaque`) — separate
+  // from `content` deltas. Translate these to Anthropic thinking-block
+  // events so Claude Code sees the actual reasoning instead of silently
+  // dropping it. Must close any thinking block BEFORE any text/tool
+  // delta arrives — Anthropic clients reject interleaved blocks.
+  if (delta.reasoning_text || delta.reasoning_opaque) {
+    if (state.contentBlockOpen && !state.thinkingBlockOpen) {
+      // A non-thinking block was open. Close it before opening thinking.
       events.push({
         type: "content_block_stop",
         index: state.contentBlockIndex,
       })
       state.contentBlockIndex++
       state.contentBlockOpen = false
+    }
+
+    if (!state.contentBlockOpen) {
+      events.push({
+        type: "content_block_start",
+        index: state.contentBlockIndex,
+        content_block: {
+          type: "thinking",
+          thinking: "",
+        },
+      })
+      state.contentBlockOpen = true
+      state.thinkingBlockOpen = true
+    }
+
+    if (delta.reasoning_text) {
+      events.push({
+        type: "content_block_delta",
+        index: state.contentBlockIndex,
+        delta: {
+          type: "thinking_delta",
+          thinking: delta.reasoning_text,
+        },
+      })
+    }
+
+    if (delta.reasoning_opaque) {
+      events.push({
+        type: "content_block_delta",
+        index: state.contentBlockIndex,
+        delta: {
+          type: "signature_delta",
+          signature: delta.reasoning_opaque,
+        },
+      })
+    }
+  }
+
+  if (delta.content) {
+    if (isToolBlockOpen(state) || state.thinkingBlockOpen) {
+      // A tool or thinking block was open, so close it before starting a text block.
+      events.push({
+        type: "content_block_stop",
+        index: state.contentBlockIndex,
+      })
+      state.contentBlockIndex++
+      state.contentBlockOpen = false
+      state.thinkingBlockOpen = false
     }
 
     if (!state.contentBlockOpen) {
@@ -95,13 +149,14 @@ export function translateChunkToAnthropicEvents(
       if (toolCall.id && toolCall.function?.name) {
         // New tool call starting.
         if (state.contentBlockOpen) {
-          // Close any previously open block.
+          // Close any previously open block (text, thinking, or another tool).
           events.push({
             type: "content_block_stop",
             index: state.contentBlockIndex,
           })
           state.contentBlockIndex++
           state.contentBlockOpen = false
+          state.thinkingBlockOpen = false
         }
 
         const anthropicBlockIndex = state.contentBlockIndex

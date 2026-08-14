@@ -1,0 +1,347 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "qid (local patch)" <xiaohanzhaoclaude@gmail.com>
+Date: Sun, 31 May 2026 06:58:13 +0000
+Subject: [PATCH] =?UTF-8?q?docs:=20add=20Appendix=20A=20=E2=80=94=20Claude?=
+ =?UTF-8?q?=20Code=20built-in=20agent=20overrides=20for=20Copilot=20path?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds a full chapter explaining the orthogonal-to-proxy layer that lives
+in ~/.claude-copilot/ (user agent files + PreToolUse hook + settings.json
+registration). Documents why naive `Explore.md` override only half-works
+(model: opus alias falls back to built-in's hardcoded haiku for some
+SDK code paths), and the clean 3-piece solution:
+
+  1. Explore-copilot.md — parallel user agent with extracted Eb5 prompt,
+     uses model: opus alias correctly (no name collision)
+  2. redirect-explore-to-copilot.py — PreToolUse hook intercepting Agent
+     tool calls AND Workflow tool script content, rewriting
+     agentType:'Explore' → 'Explore-copilot' on both paths
+  3. settings.json hooks.PreToolUse[matcher=Agent|Workflow] entry wiring
+     the hook in
+
+Verified on 2026-05-31: 100% opus dispatch, 0 HTTP 400 model_not_supported
+errors, 0 SDK-internal haiku residual, workflow exit 0. Compared to the
+override-only approach (16 opus + 2 haiku + 1 sonnet, 3 retry-swallowed
+400s), the hook approach is fully clean.
+
+Includes:
+- The 4-layer evidence
+- Why hook is preferred over binary patching (3 reasons: update churn,
+  per-version brittleness, opacity)
+- Full file reference layout
+- Step-by-step extension pattern for future built-in agents that may
+  similarly default to haiku
+- Reversion path
+
+This appendix is independent of the proxy patches (Patches 1 + 2);
+keeping it separate so the layers stay decoupled in the reader's
+mental model.
+---
+ PATCH_NOTES.md | 292 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 292 insertions(+)
+
+diff --git a/PATCH_NOTES.md b/PATCH_NOTES.md
+index af475de..111378a 100644
+--- a/PATCH_NOTES.md
++++ b/PATCH_NOTES.md
+@@ -429,3 +429,295 @@ either path now produces a complete, untruncated response.
+ Without patch 2, the daemons would silently lose 7K+ characters of
+ review reasoning per turn on long-doc prompts — exactly the workload
+ the PR pipeline runs. The patch is essential, not cosmetic.
++
++---
++
++# Appendix A: Claude Code built-in agent overrides for Copilot path
++
++**Scope:** this appendix is OUTSIDE the proxy patch — it's a separate
++configuration layer that lives in `~/.claude-copilot/` (the
++claude-copilot wrapper's profile dir). It exists because some Claude
++Code built-in agents are hardcoded to use models that aren't in
++Copilot's catalog. The proxy patch (Patch 1 + Patch 2 above) is
++about the wire-level translation; this appendix is about the
++session-level agent dispatching layer that sits above it.
++
++Added 2026-05-31.
++
++## The problem
++
++Claude Code 2.1.156+ ships built-in agentTypes with hardcoded model
++fields baked into the binary. Two of them matter on the Copilot path:
++
++| Built-in agentType | Hardcoded model | In Copilot catalog? |
++|---|---|---|
++| `Explore` | `"haiku"` → `claude-haiku-4-5-20251001` | ❌ NO (returns 400 `model_not_supported`) |
++| `statusline-setup` | `"sonnet"` → `claude-sonnet-4-*` | ✅ yes (sonnet-4.6 exposed) |
++| `Plan` | `"inherit"` (session main model) | ✅ (inherits whatever) |
++| `general-purpose` | unspecified → inherits | ✅ |
++| `worker` | unspecified → inherits | ✅ |
++| `claude` | unspecified → inherits | ✅ |
++| `workflow-subagent` | unspecified → inherits | ✅ |
++
++Only `Explore` is a hard blocker. `statusline-setup`'s sonnet works
++fine on Copilot but we override it too for uniformity (everything on
++opus).
++
++`Explore` is invoked by:
++
++1. **Model directly** — `Agent({subagent_type: "Explore", prompt: "..."})`
++   tool call.
++2. **Workflow scripts internally** — `agent("...", {agentType: "Explore"})`
++   JS calls inside the script passed to the `Workflow` tool. The
++   workflow runner spawns sub-agents from the script using the
++   agentType registered in Claude Code's internal registry.
++
++Both paths fail when the built-in Explore tries to dispatch to haiku
++via the patched copilot-api proxy — the 400 is upstream from
++GitHub Copilot, not from our proxy.
++
++## Why naive override (user agent with `name: Explore`) only half-works
++
++The obvious approach is to drop a `~/.claude-copilot/agents/Explore.md`
++file with `model: opus`, expecting Claude Code's user-agent loader to
++override the built-in registration. Empirically (tested 2026-05-31):
++
++- ✅ The override file IS loaded (debug log shows
++  `[API REQUEST] /v1/messages source=agent:custom:Explore`).
++- ❌ But the `model: opus` alias DOESN'T resolve — Claude Code falls
++  back to the built-in's hardcoded `haiku` for some code paths.
++- ❌ Even using fully-qualified `model: claude-opus-4.7-1m-internal`
++  in the override file, Claude Code's SDK has internal calls
++  (`source=sdk` tagged) that still fire to haiku independently of
++  the agent registry. These calls 400 and are retry-swallowed but
++  pollute the logs.
++
++The alias `opus` works correctly for **purely user-defined** agents
++that don't collide with built-in names (e.g., `code-reviewer-opus`).
++The collision case (same name as built-in) is what triggers the
++half-fallback bug.
++
++## The clean solution: parallel user agent + PreToolUse hook
++
++Three pieces. Each addresses a different interception point.
++
++### Piece 1: `~/.claude-copilot/agents/Explore-copilot.md`
++
++A **purely user-defined** agent (not colliding with any built-in name).
++System prompt copied verbatim from the binary's `Eb5()` function (the
++built-in Explore's getSystemPrompt). Tools restricted to read-only
++search ops (Glob, Grep, LS, Read, NotebookRead, WebFetch, WebSearch,
++BashOutput, TodoWrite). `model: opus` alias works correctly because
++there's no name collision.
++
++The complete prompt lives in the file; refer to that as the source of
++truth. The key frontmatter is:
++
++```yaml
++---
++name: Explore-copilot
++description: <same text as built-in Explore's whenToUse from binary>
++tools: Glob, Grep, LS, Read, NotebookRead, WebFetch, WebSearch, BashOutput, TodoWrite
++model: opus
++color: cyan
++---
++```
++
++### Piece 2: `~/.claude-copilot/hooks/redirect-explore-to-copilot.py`
++
++A Python PreToolUse hook that intercepts both call paths and rewrites
++`Explore` → `Explore-copilot`:
++
++```python
++def rewrite_agent_subagent_type(tool_input):
++    # Path 1: Agent({subagent_type: "Explore"}) tool call
++    if tool_input.get("subagent_type") == "Explore":
++        return {**tool_input, "subagent_type": "Explore-copilot"}
++    return None
++
++_AGENT_TYPE_RE = re.compile(
++    r"""(agentType\s*:\s*)(['"])Explore\2(?![-\w])"""
++)
++
++def rewrite_workflow_input(tool_input):
++    # Path 2a: Workflow({script: "...agent('x', {agentType: 'Explore'})..."})
++    if isinstance(tool_input.get("script"), str):
++        new_script, n = _AGENT_TYPE_RE.subn(
++            lambda m: f"{m.group(1)}{m.group(2)}Explore-copilot{m.group(2)}",
++            tool_input["script"]
++        )
++        if n > 0:
++            return {**tool_input, "script": new_script}
++
++    # Path 2b: Workflow({scriptPath: "/path/to/foo.js", resumeFromRunId: "..."})
++    # Read file, rewrite, write back in-place (scripts live under
++    # ~/.claude-copilot/projects/.../workflows/scripts/, session-scoped).
++    script_path = tool_input.get("scriptPath")
++    if isinstance(script_path, str) and os.path.isfile(script_path):
++        old = open(script_path).read()
++        new, n = _AGENT_TYPE_RE.subn(..., old)
++        if n > 0:
++            open(script_path, "w").write(new)
++    return None
++```
++
++The hook contract (per Claude Code 2.1.157):
++
++- **stdin**: JSON `{tool_name, tool_input, ...}`
++- **stdout**: JSON `{hookSpecificOutput: {hookEventName: "PreToolUse",
++  permissionDecision: "allow", updatedInput: {<rewritten>}}}`
++- **fail-open**: any parse error → emit `{}` and exit 0. Hook bugs
++  should never break the session.
++
++The word-boundary anchor `(?![-\w])` in the regex prevents
++double-rewriting `Explore-copilot` if it's already there (idempotent).
++
++### Piece 3: `~/.claude-copilot/settings.json` hook registration
++
++Append to existing `hooks.PreToolUse` array (don't replace — the
++user already has Bash/Edit/WebSearch hooks):
++
++```json
++{
++  "matcher": "Agent|Workflow",
++  "hooks": [{
++    "type": "command",
++    "command": "$HOME/.claude-copilot/hooks/redirect-explore-to-copilot.py",
++    "timeout": 10
++  }]
++}
++```
++
++`matcher: "Agent|Workflow"` is a regex matching the tool name. The
++hook fires for both tools and decides which (if any) rewrite to do
++based on tool_name internally.
++
++## Verification probe outputs (2026-05-31 — proves it works)
++
++Test: `claude-copilot -p "Use a workflow with explicit agentType:'Explore'
++to count TODOs under scripts/. Report the count in one sentence."`
++
++| Metric | Before (no override) | After Explore.md override only | After hook + Explore-copilot |
++|---|---|---|---|
++| Workflow exit code | 0 (self-recovered by dropping agentType) | 0 (with stray haiku 400s) | **0 (clean)** |
++| opus dispatches | varies | 16 | **6 (100%)** |
++| haiku dispatches | several (then dropped agentType) | 2 (SDK internals) | **0** |
++| sonnet dispatches | 0 | 1 | **0** |
++| HTTP 400 `model_not_supported` | 1+ (in initial agentType pass) | 3 (retry-swallowed) | **0** |
++| sub-agent meta.json agentType | `Explore` (failed) → drop agentType | `Explore` (failed-then-succeeded) | **`Explore-copilot` (succeeded first try)** |
++| Generated workflow script | `agentType: 'Explore'` | `agentType: 'Explore'` | **`agentType: 'Explore-copilot'`** (hook rewrote) |
++
++The hook approach achieves 100% opus dispatch with zero 400 errors and
++zero SDK haiku residual on the same workload. The override-only
++approach has measurable noise.
++
++Debug log evidence the hook fired:
++
++```
++[DEBUG] Hook PreToolUse (.../redirect-explore-to-copilot.py) returned permissionDecision: allow
++[DEBUG] Hook PreToolUse (.../redirect-explore-to-copilot.py) modified tool input keys: [script]
++[DEBUG] [API REQUEST] /v1/messages source=agent:custom:Explore-copilot
++```
++
++## Why this is better than binary-patching Claude Code
++
++Theoretical alternative: patch the Claude Code binary at the `Y8H`
++registration to change `model:"haiku"` → `model:"inherit"`. Three
++reasons this is worse:
++
++1. **Update churn**: every Claude Code release would need re-patching
++   (versions are at `~/.local/share/claude/versions/<v>/`).
++2. **Per-version brittleness**: minified variable names (`Y8H`, `Eb5`,
++   etc.) change across versions; the binary-patch script would need
++   to re-locate them.
++3. **Opacity**: a binary patch is invisible to anyone who didn't
++   write it. The hook + agent file is grep-able and self-documenting.
++
++The hook approach is **zero-invasive** to Claude Code — works across
++upgrades, leaves audit trail in the hook script and agent file.
++
++## Defense-in-depth: keep the override Explore.md too
++
++We also have `~/.claude-copilot/agents/Explore.md` (the half-working
++override). It's now redundant — the hook intercepts before
++`Explore` ever gets dispatched. But keeping it as a fallback safety
++net costs nothing: if the hook script crashes, the settings.json
++gets corrupted, or someone disables the hook for debugging, the
++Explore.md override is still there to partially work. Belt + suspenders.
++
++## How to extend this pattern to other built-in agents
++
++If a future Claude Code release adds new built-in agentTypes that
++default to haiku (or any other model not in Copilot's catalog),
++repeat the pattern:
++
++1. **Identify** the built-in by checking the binary:
++   ```bash
++   grep -aoE 'agentType:"[A-Za-z_-]+"[^{}]{0,500}' \
++     /home/qid/.local/share/claude/versions/<v> | \
++     grep -iE 'model:"haiku"|model:"sonnet"'
++   ```
++
++2. **Extract the system prompt** (the function called by
++   `getSystemPrompt`). For Eb5 example, use Python brace-matching:
++   ```python
++   blob = open(BINARY_PATH, "rb").read()
++   idx = blob.find(b"function Eb5(")
++   brace = blob.find(b"{", idx)
++   # walk braces to find matching close...
++   ```
++
++3. **Create the parallel agent** at
++   `~/.claude-copilot/agents/<Name>-copilot.md` with the extracted
++   prompt + `model: opus` (alias works because no name collision).
++
++4. **Extend the hook** (`redirect-explore-to-copilot.py`) to handle
++   the new agentType. The regex and rewrite functions are
++   parameterized — just add the new name to a map. Or split into
++   separate hook files per agentType if you want isolation.
++
++5. **No settings.json change needed** if reusing the existing
++   `Agent|Workflow` matcher entry.
++
++## Files reference
++
++```
++~/.claude-copilot/
++├── agents/
++│   ├── code-reviewer-opus.md           # pre-existing (Anthropic Max default reviewer)
++│   ├── Explore-copilot.md              # NEW — parallel agent, model: opus alias
++│   ├── Explore.md                      # NEW — fallback override, full model ID
++│   └── statusline-setup.md             # NEW — override, full model ID (uniformity)
++├── hooks/
++│   └── redirect-explore-to-copilot.py  # NEW — PreToolUse interceptor
++└── settings.json                       # MODIFIED — added Agent|Workflow PreToolUse entry
++```
++
++## Reverting this appendix
++
++If you want to undo this layer (e.g., switching back to Anthropic
++direct where haiku Explore works fine):
++
++```bash
++# Remove the hook entry from settings.json
++python3 -c "
++import json
++p = '/home/qid/.claude-copilot/settings.json'
++d = json.load(open(p))
++d['hooks']['PreToolUse'] = [
++    e for e in d['hooks']['PreToolUse']
++    if e.get('matcher') != 'Agent|Workflow'
++]
++json.dump(d, open(p,'w'), indent=2)
++"
++
++# Optionally remove the agent files + hook script
++rm ~/.claude-copilot/agents/Explore-copilot.md
++rm ~/.claude-copilot/agents/Explore.md
++rm ~/.claude-copilot/agents/statusline-setup.md
++rm ~/.claude-copilot/hooks/redirect-explore-to-copilot.py
++```
++
++The proxy patch (Patches 1 + 2 above) is INDEPENDENT and stays in
++place after this reversion. They live in `~/.local/share/copilot-api-patched/`
++and `~/.config/systemd/user/copilot-api.service`.
+-- 
+2.25.1
+

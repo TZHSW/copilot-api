@@ -1,0 +1,276 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "qid (local patch)" <xiaohanzhaoclaude@gmail.com>
+Date: Wed, 3 Jun 2026 06:26:01 +0000
+Subject: [PATCH] local patch 4: handle Anthropic adaptive thinking
+ (output_config.effort) field
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The Anthropic API introduced adaptive thinking in Opus 4.6+ / Sonnet 4.6+,
+mandatory on Opus 4.7/4.8. The new wire format replaces the legacy
+`thinking.budget_tokens` (now rejected with 400 on 4.7/4.8) with:
+
+  thinking: {type: "adaptive"}     ← enable adaptive mode
+  output_config: {effort: "xhigh"} ← guide thinking depth
+
+Patch 1 (2026-05-29) only handled the LEGACY budget_tokens path, which
+silently never fired on modern Claude Code sessions. This patch
+extends translateToOpenAI to also handle output_config.effort and
+translates it to Copilot's `reasoning_effort` field (OpenAI-format).
+
+Also fixes translateModelName: bare hyphenated `claude-opus-4-7`
+(emitted by Claude Code when the wrapper resolves the `opus` alias
+via ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7[1m] — the [1m]
+suffix is stripped client-side before send) now maps to the
+xhigh-capable `claude-opus-4.7-1m-internal` instead of base 4.7
+(which is medium-only). Same for hyphenated 4-8.
+
+Also adds an optional COPILOT_API_DUMP_PAYLOADS env-var gated
+diagnostic that writes full request/response payloads to
+/tmp/copilot-api-payloads.jsonl, bypassing journald's 48KB
+line-truncation. Useful for verifying wire shape during config
+changes; off by default.
+
+Verified end-to-end 2026-06-03:
+
+  [in-anthropic]
+    model: claude-opus-4-7
+    thinking: {type: "adaptive"}
+    output_config: {effort: "xhigh"}
+    reasoning_effort: ABSENT
+
+  [out-openai]
+    model: claude-opus-4.7-1m-internal   ← patch 3+4 routes to 1m-internal
+    thinking: ABSENT                      ← stripped (Anthropic-only field)
+    output_config: ABSENT                 ← stripped (translated below)
+    reasoning_effort: xhigh               ← patch 4 translation
+
+Zero 400 errors. PR daemons unaffected (they use dotted forms which
+pass through unchanged). Hard math probe produces ~2KB of high-quality
+multi-method reasoning — characteristic xhigh-tier output depth.
+
+This patch combined with the wrapper's new env vars completes the
+"actually-engaging-xhigh-effort-on-Copilot" goal. The wrapper now
+sets:
+  ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7[1m]   (1M context flag)
+  ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES=
+    "effort,xhigh_effort,thinking,adaptive_thinking,interleaved_thinking"
+  CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80
+  --model opus
+---
+ src/routes/messages/anthropic-types.ts        |  15 ++-
+ src/routes/messages/handler.ts                |  28 +++++
+ src/routes/messages/non-stream-translation.ts | 104 ++++++++++++++++--
+ 3 files changed, 135 insertions(+), 12 deletions(-)
+
+diff --git a/src/routes/messages/anthropic-types.ts b/src/routes/messages/anthropic-types.ts
+index d93469a..fe594d8 100644
+--- a/src/routes/messages/anthropic-types.ts
++++ b/src/routes/messages/anthropic-types.ts
+@@ -19,9 +19,22 @@ export interface AnthropicMessagesPayload {
+     name?: string
+   }
+   thinking?: {
+-    type: "enabled"
++    // "enabled" with manual budget_tokens is the LEGACY mode (Sonnet 4.5,
++    // Opus 4.5, etc.). Opus 4.6 / Sonnet 4.6 still accept it but it is
++    // deprecated. Opus 4.7 / 4.8 REJECT this mode with HTTP 400.
++    //
++    // "adaptive" is the new mode for Opus 4.6+ / Sonnet 4.6+ / Mythos.
++    // Mandatory on Opus 4.7 / 4.8. Pairs with `output_config.effort`
++    // (see field below) to guide thinking depth.
++    type: "enabled" | "adaptive" | "disabled"
+     budget_tokens?: number
+   }
++  // Newer Anthropic API field (Opus 4.6+, Sonnet 4.6+). Replaces
++  // `thinking.budget_tokens` as the effort knob.
++  // https://platform.claude.com/docs/en/build-with-claude/effort
++  output_config?: {
++    effort?: "low" | "medium" | "high" | "xhigh" | "max"
++  }
+   service_tier?: "auto" | "standard_only"
+ }
+ 
+diff --git a/src/routes/messages/handler.ts b/src/routes/messages/handler.ts
+index 6ac3127..347cb6b 100644
+--- a/src/routes/messages/handler.ts
++++ b/src/routes/messages/handler.ts
+@@ -28,12 +28,40 @@ export async function handleCompletion(c: Context) {
+   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
+   consola.debug("Anthropic request payload:", JSON.stringify(anthropicPayload))
+ 
++  // Optional full-payload dump bypassing journald's ~48KB line truncation.
++  // Set COPILOT_API_DUMP_PAYLOADS=1 to enable; writes /tmp/copilot-api-payloads.jsonl
++  // with one JSON object per request/response. Useful for diagnosing
++  // unexpected request shapes. Leave off in production — file grows unbounded.
++  if (process.env.COPILOT_API_DUMP_PAYLOADS) {
++    const fs = await import("node:fs")
++    fs.appendFileSync(
++      "/tmp/copilot-api-payloads.jsonl",
++      JSON.stringify({
++        ts: new Date().toISOString(),
++        dir: "in-anthropic",
++        body: anthropicPayload,
++      }) + "\n",
++    )
++  }
++
+   const openAIPayload = translateToOpenAI(anthropicPayload)
+   consola.debug(
+     "Translated OpenAI request payload:",
+     JSON.stringify(openAIPayload),
+   )
+ 
++  if (process.env.COPILOT_API_DUMP_PAYLOADS) {
++    const fs = await import("node:fs")
++    fs.appendFileSync(
++      "/tmp/copilot-api-payloads.jsonl",
++      JSON.stringify({
++        ts: new Date().toISOString(),
++        dir: "out-openai",
++        body: openAIPayload,
++      }) + "\n",
++    )
++  }
++
+   if (state.manualApprove) {
+     await awaitApproval()
+   }
+diff --git a/src/routes/messages/non-stream-translation.ts b/src/routes/messages/non-stream-translation.ts
+index c7ef454..d66904b 100644
+--- a/src/routes/messages/non-stream-translation.ts
++++ b/src/routes/messages/non-stream-translation.ts
+@@ -29,10 +29,28 @@ import { mapOpenAIStopReasonToAnthropic } from "./utils"
+ export function translateToOpenAI(
+   payload: AnthropicMessagesPayload,
+ ): ChatCompletionsPayload {
+-  const reasoningEffort = translateThinkingToReasoningEffort(
+-    payload.thinking,
+-    payload.model,
+-  )
++  // The effort tier can arrive via two paths:
++  //
++  //  (A) NEW (Opus 4.6+, Sonnet 4.6+, Opus 4.7/4.8 ONLY):
++  //      `output_config.effort` — adaptive-thinking-style explicit tier name.
++  //      Claude Code 2.1.161 emits this when `--effort xhigh` is set and the
++  //      model is recognized via `ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES`.
++  //
++  //  (B) LEGACY (Sonnet 4.5, Opus 4.5):
++  //      `thinking.budget_tokens` — manual integer budget. Deprecated on
++  //      Opus 4.6+ and rejected outright on Opus 4.7/4.8.
++  //
++  // Path (A) takes precedence when present. Falls back to (B) for legacy clients
++  // or when only the budget is supplied.
++  const reasoningEffort =
++    translateOutputConfigEffort(
++      payload.output_config?.effort,
++      translateModelName(payload.model),
++    ) ??
++    translateThinkingToReasoningEffort(
++      payload.thinking,
++      translateModelName(payload.model),
++    )
+ 
+   return {
+     model: translateModelName(payload.model),
+@@ -52,6 +70,54 @@ export function translateToOpenAI(
+   }
+ }
+ 
++/**
++ * Translate Anthropic's adaptive-thinking `output_config.effort` field to
++ * Copilot's `reasoning_effort` field. Both use the same tier names
++ * (`low`/`medium`/`high`/`xhigh`), with the per-model clamp from
++ * `translateThinkingToReasoningEffort`'s allowlist. The clamp ensures
++ * we don't send `xhigh` to a model that Copilot catalog-restricts to
++ * `["medium"]` — that'd 400.
++ *
++ * Returns `undefined` if no effort field present, so the caller can
++ * fall back to the legacy `thinking.budget_tokens` translation.
++ */
++function translateOutputConfigEffort(
++  effort: AnthropicMessagesPayload["output_config"] extends infer T
++    ? T extends { effort?: infer E }
++      ? E
++      : never
++    : never,
++  translatedModel: string,
++): "low" | "medium" | "high" | "xhigh" | undefined {
++  if (!effort) return undefined
++  // Copilot doesn't currently expose "max"; map to xhigh (highest available).
++  const desired = effort === "max" ? "xhigh" : effort
++
++  // Catalog-allowed tiers per model (2026-06-03 snapshot). Same table as in
++  // translateThinkingToReasoningEffort. Keyed on the TRANSLATED (dotted)
++  // model id since translateModelName runs first.
++  const allowed: Record<
++    string,
++    Array<"low" | "medium" | "high" | "xhigh">
++  > = {
++    "claude-opus-4.8": ["medium"],
++    "claude-opus-4.7": ["medium"],
++    "claude-opus-4.7-1m-internal": ["low", "medium", "high", "xhigh"],
++    "claude-opus-4.6": ["low", "medium", "high"],
++    "claude-opus-4.6-1m": ["low", "medium", "high"],
++    "claude-sonnet-4.6": ["low", "medium", "high"],
++  }
++  const supported = allowed[translatedModel]
++  if (!supported) return desired
++
++  const order = ["low", "medium", "high", "xhigh"] as const
++  const desiredIdx = order.indexOf(desired)
++  for (let i = desiredIdx; i >= 0; i--) {
++    if (supported.includes(order[i])) return order[i]
++  }
++  return supported[0] ?? "medium"
++}
++
+ /**
+  * Translate Anthropic's `thinking.budget_tokens` to Copilot's
+  * `reasoning_effort` tier, then clamp to what each model actually accepts
+@@ -161,18 +227,34 @@ function translateModelName(model: string): string {
+     "$1.$3",
+   )
+ 
+-  if (!has1m) return dotted
++  if (!has1m) {
++    // Bare hyphenated forms: Claude Code emits these in two cases:
++    //
++    //  (a) When the wrapper's `--model opus` resolves via
++    //      ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7[1m]. The [1m]
++    //      suffix is client-side-only and stripped before sending the
++    //      body — so the wire format is bare `claude-opus-4-7`.
++    //  (b) Internal sub-agent / tool-routing calls that use the bare
++    //      hyphen form regardless of wrapper config.
++    //
++    // In both cases, routing to the 1m-internal variant is strictly
++    // better than the base — the base is catalog-restricted to
++    // medium-only, while 1m-internal supports the full effort spectrum
++    // up to xhigh. Users who explicitly need the medium-only base can
++    // still get it by passing the dotted form `claude-opus-4.7`
++    // directly via COPILOT_MODEL.
++    if (dotted === "claude-opus-4.7" || dotted === "claude-opus-4.8") {
++      return "claude-opus-4.7-1m-internal"
++    }
++    return dotted
++  }
+ 
+-  // 1M-suffix forms: map to Copilot's 1M variants.
+-  // Only Opus 4.6 and 4.7 have explicit 1M variants on Copilot;
+-  // 4.8 has no 1M yet (2026-06-03 snapshot), so we fall back to
+-  // 4.7-1m-internal (xhigh-capable) as the closest 1M Opus.
++  // 1M-suffix forms (rare; usually stripped by Claude Code before send,
++  // but kept here in case some client preserves them).
+   if (dotted === "claude-opus-4.7" || dotted === "claude-opus-4.8") {
+     return "claude-opus-4.7-1m-internal"
+   }
+   if (dotted === "claude-opus-4.6") return "claude-opus-4.6-1m"
+-  // For sonnet and other families: no 1M variant exists; degrade to
+-  // the non-1m form rather than 400'ing.
+   return dotted
+ }
+ 
+-- 
+2.25.1
+

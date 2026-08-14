@@ -1,0 +1,428 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "qid (local patch)" <xiaohanzhaoclaude@gmail.com>
+Date: Fri, 29 May 2026 06:40:58 +0000
+Subject: [PATCH] local patch 2: surface reasoning_text as Anthropic thinking
+ blocks
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patch 1 alone left a silent ~5-10K-token loss per response: Copilot's
+reasoning-capable models split their output between message.content
+(the visible answer) and message.reasoning_text (the chain-of-thought).
+The base copilot-api translator only extracts content, so all the CoT
+was dropped — yielding short or empty Anthropic responses despite
+high output_tokens.
+
+Discovered when testing a 10K-token Python review prompt: the patched
+proxy returned output_tokens=8192 but content:[] (empty array). All
+8K tokens went to the silently-dropped reasoning_text field.
+
+This patch surfaces reasoning_text and reasoning_opaque on both code
+paths:
+
+- Non-streaming (translateToAnthropic): extract message.reasoning_text
+  into an Anthropic thinking content block with signature, emitted
+  BEFORE text and tool_use blocks per Anthropic ordering convention.
+
+- Streaming (translateChunkToAnthropicEvents): open a thinking content
+  block on first delta.reasoning_text, stream thinking_delta events,
+  emit signature_delta on delta.reasoning_opaque, and close the
+  thinking block when delta.content or delta.tool_calls arrives
+  (Anthropic forbids interleaved thinking/text blocks).
+
+Type additions:
+- Delta.reasoning_text + Delta.reasoning_opaque (chunk shape)
+- ResponseMessage.reasoning_text + .reasoning_opaque (non-stream shape)
+- AnthropicThinkingBlock.signature (optional, for the opaque token)
+- AnthropicStreamState.thinkingBlockOpen (track open thinking block)
+
+Verified end-to-end via /v1/messages + thinking{budget=64000} on
+claude-opus-4.7-1m-internal with a 10K-token review prompt:
+  - Streaming: 586 thinking_delta events / 7131 chars CoT
+    + 341 text_delta events / 3966 chars answer
+    + 1 signature_delta
+  - Non-streaming: 20073 chars in text (Copilot inlined this run)
+
+Without this patch, PR review daemons silently lose ~7K chars of
+reasoning per turn on long-doc prompts — the typical workload.
+
+See PATCH_NOTES.md for the full 4-layer investigation + before/after
+probe numbers.
+---
+ PATCH_NOTES.md                                | 105 ++++++++++++++++--
+ src/routes/messages/anthropic-types.ts        |  12 ++
+ src/routes/messages/handler.ts                |   1 +
+ src/routes/messages/non-stream-translation.ts |  27 ++++-
+ src/routes/messages/stream-translation.ts     |  61 +++++++++-
+ .../copilot/create-chat-completions.ts        |  19 ++++
+ 6 files changed, 209 insertions(+), 16 deletions(-)
+
+diff --git a/PATCH_NOTES.md b/PATCH_NOTES.md
+index 9e2efe7..af475de 100644
+--- a/PATCH_NOTES.md
++++ b/PATCH_NOTES.md
+@@ -110,13 +110,19 @@ curl -sS http://localhost:4141/v1/models | \
+ 
+ ## What the patch does (code-level)
+ 
+-### File 1: `src/services/copilot/create-chat-completions.ts`
++There are TWO patches stacked here, applied in sequence:
++
++### Patch 1 (2026-05-29, morning): outbound `thinking → reasoning_effort`
++
++Makes Claude Code's `--effort xhigh` flag actually fire on Copilot.
++
++#### File: `src/services/copilot/create-chat-completions.ts`
+ 
+ Added `reasoning_effort?: "low" | "medium" | "high" | "xhigh" | null` to
+ the `ChatCompletionsPayload` interface so TypeScript will allow the new
+ field to flow into the outbound request body.
+ 
+-### File 2: `src/routes/messages/non-stream-translation.ts`
++#### File: `src/routes/messages/non-stream-translation.ts`
+ 
+ Added `translateThinkingToReasoningEffort(thinking, model)` helper that:
+ 
+@@ -134,9 +140,56 @@ Added `translateThinkingToReasoningEffort(thinking, model)` helper that:
+ Wired into `translateToOpenAI` via a conditional spread:
+ `...(reasoningEffort && { reasoning_effort: reasoningEffort })`.
+ 
+-**NOT touched:** `stream-translation.ts`. Streaming requests go through
+-the same `translateToOpenAI` path before the streaming loop starts, so
+-the translation already covers both stream and non-stream cases.
++### Patch 2 (2026-05-29, afternoon): inbound `reasoning_text → thinking block`
++
++Patch 1 alone leaves a silent ~5-10K-token loss per response. Discovered
++during a long-doc + hard-question test: Copilot's reasoning-capable
++models split their output between `message.content` (the visible answer)
++and `message.reasoning_text` (the chain-of-thought). The base translator
++only extracts `content`, so all the CoT was dropped — yielding short or
++empty Anthropic responses despite high `output_tokens`.
++
++Concrete repro before patch 2 (from `~/.local/src/copilot-api-patched/`
++2026-05-29 testing): `/v1/messages + thinking{budget=64000}` on
++`claude-opus-4.7-1m-internal` with a 10K-token doc + multi-faceted
++review prompt returned `output_tokens=8192` but `content:[]` (empty)
++— all 8K tokens went to the silently-dropped `reasoning_text`.
++
++#### File: `src/services/copilot/create-chat-completions.ts`
++
++Added `reasoning_text?: string | null` and `reasoning_opaque?: string | null`
++to both the `Delta` interface (streaming chunks) and the `ResponseMessage`
++interface (non-streaming).
++
++#### File: `src/routes/messages/anthropic-types.ts`
++
++- Added optional `signature?: string` to `AnthropicThinkingBlock` so we
++  can carry Copilot's `reasoning_opaque` token through to the client.
++- Added `thinkingBlockOpen: boolean` to `AnthropicStreamState` for the
++  streaming translator to track whether the currently-open block is a
++  thinking block (which must be closed before any text/tool block).
++
++#### File: `src/routes/messages/non-stream-translation.ts`
++
++Extended `translateToAnthropic` to extract `message.reasoning_text` into
++an Anthropic `thinking` content block (with `signature` from
++`reasoning_opaque`), emitted BEFORE text and tool_use blocks per Anthropic
++ordering convention. Removed the old "GitHub Copilot doesn't generate
++thinking blocks" comment — it does now.
++
++#### File: `src/routes/messages/stream-translation.ts`
++
++Added a new branch ahead of the `delta.content` branch:
++
++- On `delta.reasoning_text`: open a `thinking` content block if not
++  already open, emit `thinking_delta` events. The thinking block stays
++  open until either `delta.content` or `delta.tool_calls` arrives, at
++  which point it's closed (Anthropic forbids interleaved thinking/text).
++- On `delta.reasoning_opaque`: emit a `signature_delta` event.
++
++#### File: `src/routes/messages/handler.ts`
++
++Initialized `thinkingBlockOpen: false` in the stream-state setup.
+ 
+ ---
+ 
+@@ -333,12 +386,46 @@ That gets us 4.8's baseline + 1M context + xhigh effort all in one model.
+ 
+ ## Probe outputs that confirmed the patch works (archived from 2026-05-29 install)
+ 
++### After patch 1 only (short-puzzle probe, ~50-token prompt)
++
+ | Config | output_tokens | text_chars | latency |
+ |---|---|---|---|
+ | 4.7-1m-internal, no thinking field | 224 | 325 | 2.9s |
+-| **4.7-1m-internal + thinking{64K} → xhigh (patched)** | **849** | **1593** | **7.3s** |
+-| 4.8 + thinking{64K} → clamped to medium (patched, no 400) | 709 | 1248 | 8.8s |
++| **4.7-1m-internal + thinking{64K} → xhigh** | **849** | **1593** | **7.3s** |
++| 4.8 + thinking{64K} → clamped to medium (no 400) | 709 | 1248 | 8.8s |
+ | 4.8 + thinking{64K} on UNPATCHED 0.7.0 (decorative) | 420 | ~800 | ~5s |
+ 
+-3.8× output growth on 4.7-1m between baseline and xhigh confirms real
+-reasoning engagement, not just longer prose.
++3.8× output growth on 4.7-1m between baseline and xhigh confirmed real
++reasoning engagement on short prompts.
++
++### After patch 2 (long-doc probe — 10K-token Python file + multi-faceted review prompt)
++
++Test prompt: review `link.py` (959 lines) for (1) concurrency risks,
++(2) error-handling gaps, (3) resource leaks, (4) subtle edge-case bugs.
++Each finding requires function name + line range + severity + 2-sentence
++explanation + fix sketch.
++
++**Patch 1 alone (silently drops reasoning_text)** — empty or short content:
++
++| Endpoint | output_tokens | text_chars | reasoning surfaced |
++|---|---|---|---|
++| /v1/messages + thinking{64K}, run #1 | 8192 | 3110 (truncated mid-finding) | ❌ |
++| /v1/messages + thinking{64K}, run #2 | 8191 | 0 (empty `content: []`) | ❌ |
++
++**Patch 2 (surfaces reasoning_text as thinking block)** — full response:
++
++| Endpoint | output_tokens | thinking_chars | text_chars | stop_reason |
++|---|---|---|---|---|
++| /v1/messages + thinking{64K}, non-streaming | 7769 | 0 (Copilot inlined this run) | 20073 | end_turn |
++| /v1/messages + thinking{64K}, **streaming** | 8192 | **7131** | 3966 | length |
++
++Streaming output (586 `thinking_delta` events + 341 `text_delta` events +
++1 `signature_delta`) confirms the CoT is now visible to Claude Code's
++daemons in the format they natively parse. The non-streaming run above
++happened to inline reasoning into `content` rather than split into
++`reasoning_text` (Copilot's behavior is non-deterministic per request);
++either path now produces a complete, untruncated response.
++
++Without patch 2, the daemons would silently lose 7K+ characters of
++review reasoning per turn on long-doc prompts — exactly the workload
++the PR pipeline runs. The patch is essential, not cosmetic.
+diff --git a/src/routes/messages/anthropic-types.ts b/src/routes/messages/anthropic-types.ts
+index 881fffc..d93469a 100644
+--- a/src/routes/messages/anthropic-types.ts
++++ b/src/routes/messages/anthropic-types.ts
+@@ -56,6 +56,12 @@ export interface AnthropicToolUseBlock {
+ export interface AnthropicThinkingBlock {
+   type: "thinking"
+   thinking: string
++  // Optional opaque signature returned by Anthropic-spec extended thinking
++  // (and by Copilot's `reasoning_opaque` field, surfaced here via the
++  // non-stream translator). Clients echo this back on follow-up turns
++  // to keep CoT context cached server-side without resending the full
++  // thinking text.
++  signature?: string
+ }
+ 
+ export type AnthropicUserContentBlock =
+@@ -196,6 +202,12 @@ export interface AnthropicStreamState {
+   messageStartSent: boolean
+   contentBlockIndex: number
+   contentBlockOpen: boolean
++  // Tracks whether the currently-open content block is the Anthropic
++  // `thinking` block (translated from Copilot's `reasoning_text` deltas).
++  // We need this distinction because thinking blocks have to be closed
++  // before any `content` or `tool_calls` delta arrives — Anthropic
++  // clients (Claude Code) reject interleaved thinking/text blocks.
++  thinkingBlockOpen: boolean
+   toolCalls: {
+     [openAIToolIndex: number]: {
+       id: string
+diff --git a/src/routes/messages/handler.ts b/src/routes/messages/handler.ts
+index 85dbf62..6ac3127 100644
+--- a/src/routes/messages/handler.ts
++++ b/src/routes/messages/handler.ts
+@@ -59,6 +59,7 @@ export async function handleCompletion(c: Context) {
+       messageStartSent: false,
+       contentBlockIndex: 0,
+       contentBlockOpen: false,
++      thinkingBlockOpen: false,
+       toolCalls: {},
+     }
+ 
+diff --git a/src/routes/messages/non-stream-translation.ts b/src/routes/messages/non-stream-translation.ts
+index fdd206e..9731df2 100644
+--- a/src/routes/messages/non-stream-translation.ts
++++ b/src/routes/messages/non-stream-translation.ts
+@@ -352,14 +352,32 @@ export function translateToAnthropic(
+   response: ChatCompletionResponse,
+ ): AnthropicResponse {
+   // Merge content from all choices
++  const allThinkingBlocks: Array<AnthropicThinkingBlock> = []
+   const allTextBlocks: Array<AnthropicTextBlock> = []
+   const allToolUseBlocks: Array<AnthropicToolUseBlock> = []
+   let stopReason: "stop" | "length" | "tool_calls" | "content_filter" | null =
+     null // default
+   stopReason = response.choices[0]?.finish_reason ?? stopReason
+ 
+-  // Process all choices to extract text and tool use blocks
++  // Process all choices to extract reasoning, text, and tool use blocks
+   for (const choice of response.choices) {
++    // Copilot reasoning models emit chain-of-thought in a separate
++    // `reasoning_text` field on the message. Surface it as an Anthropic
++    // `thinking` content block so Claude Code sees the model's actual
++    // reasoning instead of silently dropping ~5-10K tokens per response.
++    // The matching `reasoning_opaque` field becomes the thinking
++    // signature, which Anthropic clients can echo back on follow-up
++    // turns to keep the CoT cached server-side.
++    if (choice.message.reasoning_text) {
++      allThinkingBlocks.push({
++        type: "thinking",
++        thinking: choice.message.reasoning_text,
++        ...(choice.message.reasoning_opaque && {
++          signature: choice.message.reasoning_opaque,
++        }),
++      })
++    }
++
+     const textBlocks = getAnthropicTextBlocks(choice.message.content)
+     const toolUseBlocks = getAnthropicToolUseBlocks(choice.message.tool_calls)
+ 
+@@ -372,14 +390,15 @@ export function translateToAnthropic(
+     }
+   }
+ 
+-  // Note: GitHub Copilot doesn't generate thinking blocks, so we don't include them in responses
+-
+   return {
+     id: response.id,
+     type: "message",
+     role: "assistant",
+     model: response.model,
+-    content: [...allTextBlocks, ...allToolUseBlocks],
++    // Anthropic ordering convention: thinking blocks first, then text,
++    // then tool_use. Claude Code parses thinking blocks separately and
++    // displays them in the TUI as collapsed reasoning sections.
++    content: [...allThinkingBlocks, ...allTextBlocks, ...allToolUseBlocks],
+     stop_reason: mapOpenAIStopReasonToAnthropic(stopReason),
+     stop_sequence: null,
+     usage: {
+diff --git a/src/routes/messages/stream-translation.ts b/src/routes/messages/stream-translation.ts
+index 5509444..44aee4e 100644
+--- a/src/routes/messages/stream-translation.ts
++++ b/src/routes/messages/stream-translation.ts
+@@ -57,15 +57,69 @@ export function translateChunkToAnthropicEvents(
+     state.messageStartSent = true
+   }
+ 
++  // Copilot reasoning models stream chain-of-thought in `reasoning_text`
++  // deltas (and an opaque signature in `reasoning_opaque`) — separate
++  // from `content` deltas. Translate these to Anthropic thinking-block
++  // events so Claude Code sees the actual reasoning instead of silently
++  // dropping it. Must close any thinking block BEFORE any text/tool
++  // delta arrives — Anthropic clients reject interleaved blocks.
++  if (delta.reasoning_text || delta.reasoning_opaque) {
++    if (state.contentBlockOpen && !state.thinkingBlockOpen) {
++      // A non-thinking block was open. Close it before opening thinking.
++      events.push({
++        type: "content_block_stop",
++        index: state.contentBlockIndex,
++      })
++      state.contentBlockIndex++
++      state.contentBlockOpen = false
++    }
++
++    if (!state.contentBlockOpen) {
++      events.push({
++        type: "content_block_start",
++        index: state.contentBlockIndex,
++        content_block: {
++          type: "thinking",
++          thinking: "",
++        },
++      })
++      state.contentBlockOpen = true
++      state.thinkingBlockOpen = true
++    }
++
++    if (delta.reasoning_text) {
++      events.push({
++        type: "content_block_delta",
++        index: state.contentBlockIndex,
++        delta: {
++          type: "thinking_delta",
++          thinking: delta.reasoning_text,
++        },
++      })
++    }
++
++    if (delta.reasoning_opaque) {
++      events.push({
++        type: "content_block_delta",
++        index: state.contentBlockIndex,
++        delta: {
++          type: "signature_delta",
++          signature: delta.reasoning_opaque,
++        },
++      })
++    }
++  }
++
+   if (delta.content) {
+-    if (isToolBlockOpen(state)) {
+-      // A tool block was open, so close it before starting a text block.
++    if (isToolBlockOpen(state) || state.thinkingBlockOpen) {
++      // A tool or thinking block was open, so close it before starting a text block.
+       events.push({
+         type: "content_block_stop",
+         index: state.contentBlockIndex,
+       })
+       state.contentBlockIndex++
+       state.contentBlockOpen = false
++      state.thinkingBlockOpen = false
+     }
+ 
+     if (!state.contentBlockOpen) {
+@@ -95,13 +149,14 @@ export function translateChunkToAnthropicEvents(
+       if (toolCall.id && toolCall.function?.name) {
+         // New tool call starting.
+         if (state.contentBlockOpen) {
+-          // Close any previously open block.
++          // Close any previously open block (text, thinking, or another tool).
+           events.push({
+             type: "content_block_stop",
+             index: state.contentBlockIndex,
+           })
+           state.contentBlockIndex++
+           state.contentBlockOpen = false
++          state.thinkingBlockOpen = false
+         }
+ 
+         const anthropicBlockIndex = state.contentBlockIndex
+diff --git a/src/services/copilot/create-chat-completions.ts b/src/services/copilot/create-chat-completions.ts
+index 7a9d4a5..77c72e0 100644
+--- a/src/services/copilot/create-chat-completions.ts
++++ b/src/services/copilot/create-chat-completions.ts
+@@ -81,6 +81,15 @@ interface Delta {
+       arguments?: string
+     }
+   }>
++
++  // Copilot-specific extension: chain-of-thought (CoT) chunks for reasoning
++  // models. Streamed alongside `content` deltas. We surface them as
++  // Anthropic `thinking_delta` events in the stream translator and as
++  // a `thinking` content block in the non-stream translator. Without
++  // this, Copilot's reasoning output is silently dropped because the
++  // base translator only extracts `content` deltas.
++  reasoning_text?: string | null
++  reasoning_opaque?: string | null
+ }
+ 
+ interface Choice {
+@@ -113,6 +122,16 @@ interface ResponseMessage {
+   role: "assistant"
+   content: string | null
+   tool_calls?: Array<ToolCall>
++
++  // Copilot-specific extension: chain-of-thought (CoT) for reasoning
++  // models. Present on non-streaming responses when the model emits
++  // a reasoning summary. `reasoning_text` is human-readable; the
++  // matching `reasoning_opaque` is a token-bound signature Anthropic
++  // clients can use to chain follow-up turns with cached thinking
++  // state (see Anthropic API: extended thinking signature). We surface
++  // these as an Anthropic `thinking` content block in translateToAnthropic.
++  reasoning_text?: string | null
++  reasoning_opaque?: string | null
+ }
+ 
+ interface ChoiceNonStreaming {
+-- 
+2.25.1
+

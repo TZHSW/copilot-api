@@ -1,5 +1,6 @@
+import { state } from "~/lib/state"
+
 import {
-  type ChatCompletionResponse,
   type ChatCompletionsPayload,
   type ContentPart,
   type Message,
@@ -29,8 +30,11 @@ import { mapOpenAIStopReasonToAnthropic } from "./utils"
 export function translateToOpenAI(
   payload: AnthropicMessagesPayload,
 ): ChatCompletionsPayload {
+  const translatedModel = translateModelName(payload.model)
+  const reasoningFields = translateReasoningFields(payload, translatedModel)
+
   return {
-    model: translateModelName(payload.model),
+    model: translatedModel,
     messages: translateAnthropicMessagesToOpenAI(
       payload.messages,
       payload.system,
@@ -43,17 +47,183 @@ export function translateToOpenAI(
     user: payload.metadata?.user_id,
     tools: translateAnthropicToolsToOpenAI(payload.tools),
     tool_choice: translateAnthropicToolChoiceToOpenAI(payload.tool_choice),
+    ...reasoningFields,
   }
 }
 
-function translateModelName(model: string): string {
-  // Subagent requests use a specific model number which Copilot doesn't support
-  if (model.startsWith("claude-sonnet-4-")) {
-    return model.replace(/^claude-sonnet-4-.*/, "claude-sonnet-4")
-  } else if (model.startsWith("claude-opus-")) {
-    return model.replace(/^claude-opus-4-.*/, "claude-opus-4")
+/**
+ * Translate Anthropic's thinking/effort fields into Copilot's reasoning
+ * fields. Only emits fields if the target model supports reasoning.
+ *
+ * Anthropic side:
+ *   - output_config.effort  → effort tier (new path, Opus 4.6+)
+ *   - thinking.budget_tokens → effort tier (legacy path, Opus 4.5)
+ *   - thinking.type          → adaptive / enabled / disabled
+ *
+ * Copilot side:
+ *   - reasoning_effort  → effort tier string
+ *   - reasoning.effort  → effort tier object (triggers reasoning_text return)
+ *   - thinking          → adaptive/enabled thinking mode
+ */
+function translateReasoningFields(
+  payload: AnthropicMessagesPayload,
+  translatedModel: string,
+): Partial<ChatCompletionsPayload> {
+  if (!modelSupportsReasoning(translatedModel)) return {}
+
+  const effort =
+    translateOutputConfigEffort(payload.output_config?.effort) ??
+    translateThinkingToReasoningEffort(payload.thinking)
+
+  const thinking = translateThinking(payload.thinking)
+
+  return {
+    ...(effort && { reasoning_effort: effort }),
+    ...(effort && { reasoning: { effort } }),
+    ...(thinking && { thinking }),
   }
-  return model
+}
+
+/**
+ * Translate Anthropic's `output_config.effort` to a reasoning effort tier.
+ * Maps "max" → "xhigh" (Copilot doesn't expose "max").
+ */
+function translateOutputConfigEffort(
+  effort: AnthropicMessagesPayload["output_config"] extends infer T
+    ? T extends { effort?: infer E }
+      ? E
+      : never
+    : never,
+): "low" | "medium" | "high" | "xhigh" | undefined {
+  if (!effort) return undefined
+  // Copilot doesn't currently expose "max"; map to xhigh (highest available).
+  return effort === "max" ? "xhigh" : effort
+}
+
+/**
+ * Translate Anthropic's `thinking` field to Copilot's format.
+ *
+ * Anthropic sends:
+ *   - {type: "adaptive"}           — new path, model decides thinking depth
+ *   - {type: "enabled", budget_tokens: N} — legacy path, explicit budget
+ *   - {type: "disabled"}           — explicitly off
+ *
+ * Copilot accepts the same structure on Claude models, so we pass through
+ * adaptive/enabled and drop disabled (no point sending it).
+ */
+function translateThinking(
+  thinking: AnthropicMessagesPayload["thinking"],
+): ChatCompletionsPayload["thinking"] | undefined {
+  if (!thinking || thinking.type === "disabled") return undefined
+  return thinking
+}
+
+/**
+ * Translate Anthropic's `thinking.budget_tokens` to Copilot's
+ * `reasoning_effort` tier.
+ *
+ * Budget thresholds match Claude Code's `--effort` flag mapping:
+ *   low      → budget ≈ 1024 (Anthropic minimum)
+ *   medium   → budget ≈ 8K
+ *   high     → budget ≈ 16K-32K
+ *   xhigh    → budget ≈ 64K (Claude Code default on Opus 4.7/4.8)
+ */
+function translateThinkingToReasoningEffort(
+  thinking: AnthropicMessagesPayload["thinking"],
+): "low" | "medium" | "high" | "xhigh" | undefined {
+  if (!thinking || thinking.type !== "enabled") return undefined
+
+  const budget = thinking.budget_tokens ?? 0
+  if (budget >= 50000) return "xhigh"
+  if (budget >= 16000) return "high"
+  if (budget >= 4096) return "medium"
+  return "low"
+}
+
+/**
+ * Translate the model id from Claude-Code-internal hyphenated form
+ * (e.g. `claude-opus-4-7`, `claude-opus-4-7[1m]`) into the Copilot
+ * Enterprise catalog form (dotted, plus Microsoft-internal 1m variant).
+ *
+ * Background: Claude Code's internal model registry uses hyphenated ids
+ * (`claude-opus-4-7`, `claude-sonnet-4-6`) for sub-agent dispatch, tool
+ * routing, and the `[1m]` syntactic-suffix for 1M-context variants
+ * (`claude-opus-4-7[1m]`, `claude-opus-4-6[1m]`). The Copilot Enterprise
+ * catalog uses DOTTED ids (`claude-opus-4.7`, `claude-opus-4.6`,
+ * `claude-opus-4.7-1m-internal`). The original upstream copilot-api
+ * 0.7.0 translation collapses every hyphenated opus to bare
+ * `claude-opus-4` and every hyphenated sonnet to `claude-sonnet-4`,
+ * both of which 400 on Copilot — so every sub-agent / tool-routing
+ * call silently failed before this patch.
+ *
+ * Translation table (verified against Copilot catalog 2026-06-03):
+ *
+ *   claude-opus-4-7[1m]    → claude-opus-4.7-1m-internal  (xhigh-capable)
+ *   claude-opus-4-7        → claude-opus-4.7              (medium-only)
+ *   claude-opus-4-8[1m]    → claude-opus-4.7-1m-internal  (no 4.8 1M yet, use 4.7-1m)
+ *   claude-opus-4-8        → claude-opus-4.8              (medium-only)
+ *   claude-opus-4-6[1m]    → claude-opus-4.6-1m
+ *   claude-opus-4-6        → claude-opus-4.6
+ *   claude-opus-4-5[…]     → claude-opus-4.5              (no effort spectrum)
+ *   claude-sonnet-4-6[…]   → claude-sonnet-4.6            (no 1M sonnet on Copilot)
+ *   claude-sonnet-4-5      → claude-sonnet-4.5
+ *   claude-haiku-4-5       → claude-haiku-4.5             (catalog has it, no effort)
+ *
+ * Pass-through: anything already in dotted form (`claude-opus-4.7-1m-internal`,
+ * `claude-opus-4.8`, `gpt-5.5`, etc.) is returned unchanged.
+ */
+function catalogHasModel(id: string): boolean {
+  return state.models?.data.some((m) => m.id === id) ?? false
+}
+
+// Check if the translated model supports reasoning_effort via catalog capabilities.
+function modelSupportsReasoning(translatedModel: string): boolean {
+  const model = state.models?.data.find((m) => m.id === translatedModel)
+  const re = (model?.capabilities as Record<string, unknown>)?.supports as
+    | Record<string, unknown>
+    | undefined
+  return Array.isArray(re?.reasoning_effort)
+}
+
+// Try to find the 1M variant of a model in the catalog.
+// Returns the 1M catalog id, or the original model if no 1M variant exists.
+function resolve1mVariant(base: string): string {
+  const candidates = [`${base}-1m-internal`, `${base}-1m`]
+  return candidates.find(catalogHasModel) ?? base
+}
+
+function translateModelName(model: string): string {
+  // Strip date suffixes (e.g. `-20251001`).
+  const undated = model.replace(/-\d{8}$/, "")
+
+  // Strip `[1m]` suffix, remember it was there.
+  const has1m = undated.endsWith("[1m]")
+  const base = has1m ? undated.slice(0, -"[1m]".length) : undated
+
+  // Normalize hyphen form → dot form for the version number only.
+  // claude-opus-4-7        → claude-opus-4.7
+  // claude-opus-4-7-1m     → claude-opus-4.7-1m
+  // claude-opus-4-7-1m-internal → claude-opus-4.7-1m-internal
+  // Already-dotted forms pass through unchanged.
+  const normalized = base.replace(
+    /^(claude-(?:opus|sonnet|haiku)-(\d+))-(\d+)/,
+    "$1.$3",
+  )
+
+  // Restore [1m] → best available 1M variant in catalog
+  if (has1m && !normalized.includes("-1m")) {
+    return resolve1mVariant(normalized)
+  }
+
+  // Bare opus models (no -1m suffix): on Anthropic's official API these
+  // are natively 1M-context. Copilot splits them into a 200K base and a
+  // separate 1M variant. Route bare names to the 1M variant so behavior
+  // matches the official API. Falls back to base if no 1M variant exists.
+  if (!normalized.includes("-1m") && /^claude-opus-4\.\d+$/.test(normalized)) {
+    return resolve1mVariant(normalized)
+  }
+
+  return normalized
 }
 
 function translateAnthropicMessagesToOpenAI(
@@ -282,14 +452,32 @@ export function translateToAnthropic(
   response: ChatCompletionResponse,
 ): AnthropicResponse {
   // Merge content from all choices
+  const allThinkingBlocks: Array<AnthropicThinkingBlock> = []
   const allTextBlocks: Array<AnthropicTextBlock> = []
   const allToolUseBlocks: Array<AnthropicToolUseBlock> = []
   let stopReason: "stop" | "length" | "tool_calls" | "content_filter" | null =
     null // default
   stopReason = response.choices[0]?.finish_reason ?? stopReason
 
-  // Process all choices to extract text and tool use blocks
+  // Process all choices to extract reasoning, text, and tool use blocks
   for (const choice of response.choices) {
+    // Copilot reasoning models emit chain-of-thought in a separate
+    // `reasoning_text` field on the message. Surface it as an Anthropic
+    // `thinking` content block so Claude Code sees the model's actual
+    // reasoning instead of silently dropping ~5-10K tokens per response.
+    // The matching `reasoning_opaque` field becomes the thinking
+    // signature, which Anthropic clients can echo back on follow-up
+    // turns to keep the CoT cached server-side.
+    if (choice.message.reasoning_text) {
+      allThinkingBlocks.push({
+        type: "thinking",
+        thinking: choice.message.reasoning_text,
+        ...(choice.message.reasoning_opaque && {
+          signature: choice.message.reasoning_opaque,
+        }),
+      })
+    }
+
     const textBlocks = getAnthropicTextBlocks(choice.message.content)
     const toolUseBlocks = getAnthropicToolUseBlocks(choice.message.tool_calls)
 
@@ -302,14 +490,15 @@ export function translateToAnthropic(
     }
   }
 
-  // Note: GitHub Copilot doesn't generate thinking blocks, so we don't include them in responses
-
   return {
     id: response.id,
     type: "message",
     role: "assistant",
     model: response.model,
-    content: [...allTextBlocks, ...allToolUseBlocks],
+    // Anthropic ordering convention: thinking blocks first, then text,
+    // then tool_use. Claude Code parses thinking blocks separately and
+    // displays them in the TUI as collapsed reasoning sections.
+    content: [...allThinkingBlocks, ...allTextBlocks, ...allToolUseBlocks],
     stop_reason: mapOpenAIStopReasonToAnthropic(stopReason),
     stop_sequence: null,
     usage: {

@@ -19,8 +19,21 @@ export interface AnthropicMessagesPayload {
     name?: string
   }
   thinking?: {
-    type: "enabled"
+    // "enabled" with manual budget_tokens is the LEGACY mode (Sonnet 4.5,
+    // Opus 4.5, etc.). Opus 4.6 / Sonnet 4.6 still accept it but it is
+    // deprecated. Opus 4.7 / 4.8 REJECT this mode with HTTP 400.
+    //
+    // "adaptive" is the new mode for Opus 4.6+ / Sonnet 4.6+ / Mythos.
+    // Mandatory on Opus 4.7 / 4.8. Pairs with `output_config.effort`
+    // (see field below) to guide thinking depth.
+    type: "enabled" | "adaptive" | "disabled"
     budget_tokens?: number
+  }
+  // Newer Anthropic API field (Opus 4.6+, Sonnet 4.6+). Replaces
+  // `thinking.budget_tokens` as the effort knob.
+  // https://platform.claude.com/docs/en/build-with-claude/effort
+  output_config?: {
+    effort?: "low" | "medium" | "high" | "xhigh" | "max"
   }
   service_tier?: "auto" | "standard_only"
 }
@@ -42,7 +55,7 @@ export interface AnthropicImageBlock {
 export interface AnthropicToolResultBlock {
   type: "tool_result"
   tool_use_id: string
-  content: string
+  content: string | Array<AnthropicTextBlock | AnthropicImageBlock>
   is_error?: boolean
 }
 
@@ -56,6 +69,12 @@ export interface AnthropicToolUseBlock {
 export interface AnthropicThinkingBlock {
   type: "thinking"
   thinking: string
+  // Optional opaque signature returned by Anthropic-spec extended thinking
+  // (and by Copilot's `reasoning_opaque` field, surfaced here via the
+  // non-stream translator). Clients echo this back on follow-up turns
+  // to keep CoT context cached server-side without resending the full
+  // thinking text.
+  signature?: string
 }
 
 export type AnthropicUserContentBlock =
@@ -196,6 +215,12 @@ export interface AnthropicStreamState {
   messageStartSent: boolean
   contentBlockIndex: number
   contentBlockOpen: boolean
+  // Tracks whether the currently-open content block is the Anthropic
+  // `thinking` block (translated from Copilot's `reasoning_text` deltas).
+  // We need this distinction because thinking blocks have to be closed
+  // before any `content` or `tool_calls` delta arrives — Anthropic
+  // clients (Claude Code) reject interleaved thinking/text blocks.
+  thinkingBlockOpen: boolean
   toolCalls: {
     [openAIToolIndex: number]: {
       id: string

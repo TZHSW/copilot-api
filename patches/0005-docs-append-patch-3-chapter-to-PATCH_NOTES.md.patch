@@ -1,0 +1,176 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "qid (local patch)" <xiaohanzhaoclaude@gmail.com>
+Date: Wed, 3 Jun 2026 05:20:21 +0000
+Subject: [PATCH] docs: append patch 3 chapter to PATCH_NOTES.md
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Covers the translateModelName rewrite, the 1M context unlock mechanism
+(client-side [1m] syntax + proxy-side hyphen→dot translation), the
+upstream model distribution verification table, and the future-patch-4
+TODO noting that the per-model clamp lookup happens before model
+translation (latent footgun, currently benign because sub-agents don't
+emit thinking fields).
+---
+ PATCH_NOTES.md | 147 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 147 insertions(+)
+
+diff --git a/PATCH_NOTES.md b/PATCH_NOTES.md
+index 111378a..c260fac 100644
+--- a/PATCH_NOTES.md
++++ b/PATCH_NOTES.md
+@@ -721,3 +721,150 @@ rm ~/.claude-copilot/hooks/redirect-explore-to-copilot.py
+ The proxy patch (Patches 1 + 2 above) is INDEPENDENT and stays in
+ place after this reversion. They live in `~/.local/share/copilot-api-patched/`
+ and `~/.config/systemd/user/copilot-api.service`.
++
++---
++
++## Patch 3 (2026-06-03, afternoon): correct `translateModelName` for hyphen / `[1m]` forms
++
++Patches 1 and 2 covered the request-body translation (thinking →
++reasoning_effort) and the response-body translation (reasoning_text →
++thinking block). But upstream copilot-api 0.7.0 also has a broken
++**model-id translation** that wasn't on our radar until 2026-06-03:
++
++```ts
++// upstream original:
++if (model.startsWith("claude-opus-")) {
++  return model.replace(/^claude-opus-4-.*/, "claude-opus-4")
++}
++```
++
++This collapses every hyphenated opus id to bare `claude-opus-4` — which
++isn't in Copilot's catalog. Claude Code's internal sub-agent dispatch
++and tool routing use the hyphen form (`claude-opus-4-7`,
++`claude-opus-4-8`), so every one of those calls 400'd with
++`model_not_supported`. Claude Code's retry layer absorbed the 400s
++silently, but it polluted debug logs and (worse) prevented the
++`[1m]` 1M-context syntax from working at all.
++
++### What patch 3 does
++
++Replaced `translateModelName` with explicit hyphen→dot translation plus
++`[1m]` suffix mapping:
++
++```ts
++function translateModelName(model: string): string {
++  const has1m = model.endsWith("[1m]")
++  const base = has1m ? model.slice(0, -"[1m]".length) : model
++
++  const dotted = base.replace(
++    /^(claude-(?:opus|sonnet|haiku)-(\d+))-(\d+)/,
++    "$1.$3",
++  )
++
++  if (!has1m) return dotted
++  if (dotted === "claude-opus-4.7" || dotted === "claude-opus-4.8")
++    return "claude-opus-4.7-1m-internal"
++  if (dotted === "claude-opus-4.6") return "claude-opus-4.6-1m"
++  return dotted
++}
++```
++
++Translation table:
++
++| Input (Claude Code emits) | Output (Copilot catalog form) |
++|---|---|
++| `claude-opus-4-7[1m]` | `claude-opus-4.7-1m-internal` (xhigh-capable) |
++| `claude-opus-4-7` | `claude-opus-4.7` (medium-only) |
++| `claude-opus-4-8[1m]` | `claude-opus-4.7-1m-internal` (fallback; no 4.8 1M in catalog) |
++| `claude-opus-4-8` | `claude-opus-4.8` (medium-only) |
++| `claude-opus-4-6[1m]` | `claude-opus-4.6-1m` |
++| `claude-opus-4-6` | `claude-opus-4.6` |
++| `claude-sonnet-4-6[1m]` | `claude-sonnet-4.6` (no sonnet 1M on Copilot — degrade rather than 400) |
++| `claude-sonnet-4-6` | `claude-sonnet-4.6` |
++| `claude-haiku-4-5` | `claude-haiku-4.5` |
++| `claude-opus-4.7-1m-internal` (already dotted) | pass-through |
++| `gpt-5.5` | pass-through |
++
++### Why it matters: 1M context unlock
++
++Before patch 3, the wrapper passed `--model claude-opus-4.7-1m-internal`
++(literal Copilot id, dotted). Claude Code's client-side LMH model
++registry doesn't know this id, so it fell back to a generic 200K context
++window → autocompact threshold sat at `effectiveWindow=180000` tokens.
++~820K of usable 1M context was unreachable.
++
++After patch 3, the wrapper passes `--model claude-opus-4-7[1m]` instead.
++Claude Code DOES recognize this form (saw `claude-opus-4-6[1m]` and
++`claude-opus-4-7[1m]` strings in the binary's LMH table) → switches
++client-side autocompact to 1M-context mode → effectiveWindow jumps to
++~480000. The proxy's new translateModelName transparently maps
++`claude-opus-4-7[1m]` to `claude-opus-4.7-1m-internal` upstream.
++
++Verified 2026-06-03 — upstream model distribution during a substantive
++session:
++
++| Upstream model | Count | Source |
++|---|---|---|
++| `claude-opus-4.7-1m-internal` | 4 | main chat (1M + xhigh-eligible) |
++| `claude-opus-4.7` | 2 | sub-agent dispatch (medium-only, fine) |
++| HTTP 400 errors | **0** | (previously 3 per session from collapsed `claude-opus-4`) |
++
++### Wrapper change tied to this patch
++
++`~/.local/bin/claude-copilot` changed `COPILOT_MODEL` default from
++`claude-opus-4.7-1m-internal` (literal Copilot id) to
++`claude-opus-4-7[1m]` (Claude-Code-recognized 1M syntax). The wrapper's
++old behavior (passing the literal Copilot id) still works thanks to the
++pass-through rule for already-dotted ids, but loses the 1M autocompact
++window. Both forms reach the right upstream model now — the difference
++is whether Claude Code's CLIENT-SIDE behavior knows it's a 1M model.
++
++### Maintenance: when does the `[1m]→4.8-1m-internal` mapping update
++
++Currently `claude-opus-4-8[1m]` maps to `claude-opus-4.7-1m-internal`
++(fallback) because Microsoft hasn't shipped a 4.8 1M variant yet (latest
++catalog snapshot: 2026-06-03). When `claude-opus-4.8-1m-internal` or
++`claude-opus-4.8-1m` appears in Copilot's catalog, update the
++translation table in `src/routes/messages/non-stream-translation.ts`:
++
++```ts
++if (dotted === "claude-opus-4.8") return "claude-opus-4.8-1m-internal"
++if (dotted === "claude-opus-4.7") return "claude-opus-4.7-1m-internal"  // keep
++```
++
++Also update the wrapper default to `claude-opus-4-8[1m]` if you want
++Copilot sessions to use the 4.8 baseline by default — but consider
++that 4.7-1m-internal currently has the better effort spectrum
++(`[low, medium, high, xhigh]`) while 4.8 base is restricted to
++`["medium"]`. Once 4.8 1M variant exists, check its catalog
++`reasoning_effort` field before flipping.
++
++### Per-model clamp table interaction
++
++The clamp table in `translateThinkingToReasoningEffort` keys on the
++**dotted (post-translation) form**:
++
++```ts
++"claude-opus-4.7-1m-internal": ["low", "medium", "high", "xhigh"],
++"claude-opus-4.7":             ["medium"],
++"claude-opus-4.8":             ["medium"],
++```
++
++So a request with `model: claude-opus-4-7[1m]`, `thinking: {budget: 64K}`
++flows through:
++
++1. `translateThinkingToReasoningEffort(thinking, "claude-opus-4-7[1m]")`
++   → currently returns `desired` directly (model not in clamp table)
++   because table is keyed on POST-translation form.
++
++That's a **bug** — the clamp lookup should be on the translated id, not
++the raw input. **TODO** for a future patch 4: do model translation
++first, then clamp lookup. For now, this means sub-agent calls with
++`claude-opus-4-7` get whatever effort tier the client requested without
++clamping — which can 400 if Claude Code sends xhigh on a medium-only
++model.
++
++Empirically (2026-06-03) we haven't seen this 400 in practice — likely
++because sub-agent calls don't include a `thinking` field anyway. But
++the clamp ordering bug is a latent footgun. Fix tracked but not
++currently impacting normal usage.
+-- 
+2.25.1
+

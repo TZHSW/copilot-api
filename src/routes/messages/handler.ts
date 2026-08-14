@@ -11,6 +11,7 @@ import {
   type ChatCompletionChunk,
   type ChatCompletionResponse,
 } from "~/services/copilot/create-chat-completions"
+import { createResponses } from "~/services/copilot/create-responses"
 
 import {
   type AnthropicMessagesPayload,
@@ -20,19 +21,67 @@ import {
   translateToAnthropic,
   translateToOpenAI,
 } from "./non-stream-translation"
+import {
+  newResponsesStreamState,
+  translateAnthropicToResponses,
+  translateResponsesResultToAnthropic,
+  translateResponsesStreamEvent,
+} from "./responses-translation"
 import { translateChunkToAnthropicEvents } from "./stream-translation"
+
+// Copilot's GPT-5.x models are responses-only — they reject /chat/completions
+// with `unsupported_api_for_model`. Route them through /responses instead.
+function isResponsesOnlyModel(model: string): boolean {
+  return /^gpt-5/i.test(model)
+}
 
 export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
 
   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
-  consola.debug("Anthropic request payload:", JSON.stringify(anthropicPayload))
+  consola.info("Anthropic request: model=%s thinking=%s output_config=%s",
+    anthropicPayload.model,
+    JSON.stringify(anthropicPayload.thinking),
+    JSON.stringify(anthropicPayload.output_config),
+  )
+
+  if (isResponsesOnlyModel(anthropicPayload.model)) {
+    return handleViaResponses(c, anthropicPayload)
+  }
+
+  // Optional full-payload dump bypassing journald's ~48KB line truncation.
+  // Set COPILOT_API_DUMP_PAYLOADS=1 to enable; writes /tmp/copilot-api-payloads.jsonl
+  // with one JSON object per request/response. Useful for diagnosing
+  // unexpected request shapes. Leave off in production — file grows unbounded.
+  if (process.env.COPILOT_API_DUMP_PAYLOADS) {
+    const fs = await import("node:fs")
+    fs.appendFileSync(
+      "/tmp/copilot-api-payloads.jsonl",
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        dir: "in-anthropic",
+        body: anthropicPayload,
+      }) + "\n",
+    )
+  }
 
   const openAIPayload = translateToOpenAI(anthropicPayload)
-  consola.debug(
-    "Translated OpenAI request payload:",
-    JSON.stringify(openAIPayload),
+  consola.info("Translated OpenAI: model=%s reasoning_effort=%s",
+    openAIPayload.model,
+    openAIPayload.reasoning_effort ?? "NOT SET",
   )
+
+  if (process.env.COPILOT_API_DUMP_PAYLOADS) {
+    const fs = await import("node:fs")
+    fs.appendFileSync(
+      "/tmp/copilot-api-payloads.jsonl",
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        dir: "out-openai",
+        body: openAIPayload,
+      }) + "\n",
+    )
+  }
 
   if (state.manualApprove) {
     await awaitApproval()
@@ -59,6 +108,7 @@ export async function handleCompletion(c: Context) {
       messageStartSent: false,
       contentBlockIndex: 0,
       contentBlockOpen: false,
+      thinkingBlockOpen: false,
       toolCalls: {},
     }
 
@@ -89,3 +139,55 @@ export async function handleCompletion(c: Context) {
 const isNonStreaming = (
   response: Awaited<ReturnType<typeof createChatCompletions>>,
 ): response is ChatCompletionResponse => Object.hasOwn(response, "choices")
+
+// GPT-5.x path: translate Anthropic Messages <-> OpenAI Responses and forward
+// to Copilot's /responses endpoint (the only one that serves these models).
+async function handleViaResponses(
+  c: Context,
+  anthropicPayload: AnthropicMessagesPayload,
+) {
+  const responsesPayload = translateAnthropicToResponses(anthropicPayload)
+  consola.info(
+    "Routing model=%s via /responses (responses-only model)",
+    anthropicPayload.model,
+  )
+
+  if (state.manualApprove) {
+    await awaitApproval()
+  }
+
+  const response = await createResponses(responsesPayload)
+
+  if (!(typeof response === "object" && Symbol.asyncIterator in response)) {
+    const anthropicResponse = translateResponsesResultToAnthropic(
+      response as Record<string, unknown>,
+      anthropicPayload.model,
+    )
+    return c.json(anthropicResponse)
+  }
+
+  const responseStream = response as AsyncIterable<{ data?: string }>
+  return streamSSE(c, async (stream) => {
+    const streamState = newResponsesStreamState()
+    for await (const rawEvent of responseStream) {
+      if (!rawEvent.data || rawEvent.data === "[DONE]") {
+        continue
+      }
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(rawEvent.data)
+      } catch {
+        continue
+      }
+      const events = translateResponsesStreamEvent(
+        parsed as Parameters<typeof translateResponsesStreamEvent>[0],
+        streamState,
+        anthropicPayload.model,
+      )
+      for (const event of events) {
+        await stream.writeSSE({ event: event.type, data: JSON.stringify(event) })
+      }
+    }
+  })
+}
+
