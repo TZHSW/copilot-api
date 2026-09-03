@@ -54,14 +54,18 @@ function Test-Port([int]$PortNumber) {
   }
 }
 
-function Wait-ApiReady([int]$PortNumber, [int]$Attempts = 120) {
-  for ($attempt = 0; $attempt -lt $Attempts; $attempt++) {
+function Wait-ApiReady([int]$PortNumber, [int]$TimeoutSeconds = 30) {
+  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+  $lastFailure = "no response"
+  while ([DateTime]::UtcNow -lt $deadline) {
     try {
-      $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$PortNumber/" -TimeoutSec 2
-      if ($response.StatusCode -eq 200) { return $true }
-    } catch {}
+      $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$PortNumber/" -TimeoutSec 1
+      if ($response.StatusCode -eq 200 -and $response.Content -eq "Server running") { return $true }
+      $lastFailure = "HTTP $($response.StatusCode): $($response.Content)"
+    } catch { $lastFailure = $_.Exception.Message }
     Start-Sleep -Milliseconds 250
   }
+  Write-Warning "API on port $PortNumber was not ready after ${TimeoutSeconds}s: $lastFailure"
   return $false
 }
 
@@ -328,8 +332,16 @@ try {
   if ($LASTEXITCODE -ne 0) { throw "Service verification failed" }
   $Mutated = $false
 } catch {
+  $installError = $_
+  foreach ($logName in @("error.log", "run.log")) {
+    $logFile = Join-Path $Share $logName
+    if (Test-Path $logFile) {
+      Write-Warning "Last lines from ${logName}:"
+      Get-Content -LiteralPath $logFile -Tail 30 | ForEach-Object { Write-Warning $_ }
+    }
+  }
   if ($Mutated) { Restore-Installation }
-  throw
+  throw $installError
 }
 
 Write-Host "`nInstallation complete: API=http://localhost:$Port/v1 Codex=$CodexHome" -ForegroundColor Green
