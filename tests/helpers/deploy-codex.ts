@@ -100,7 +100,25 @@ export async function createCompleteInstallerFixture() {
   await chmod(join(bin, "codex"), 0o755)
   await writeFixture(
     join(packageRoot, "dist/main.js"),
-    "console.log('fixture')\n",
+    `import http from "node:http"
+const args = process.argv.slice(2)
+const port = Number(args[args.indexOf("--port") + 1])
+const server = http.createServer((request, response) => {
+  if (request.url === "/") {
+    response.end("Server running")
+    return
+  }
+  if (request.url?.startsWith("/v1/models")) {
+    response.setHeader("content-type", "application/json")
+    response.end(JSON.stringify({ object: "list", data: [{ id: "gpt-5.6-sol" }] }))
+    return
+  }
+  response.statusCode = 503
+  response.end("offline fixture")
+})
+server.listen(port)
+for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => server.close(() => process.exit(0)))
+`,
   )
   await writeFixture(
     join(packageRoot, "codex-config/config.toml"),
@@ -125,7 +143,7 @@ export async function createCompleteInstallerFixture() {
     join(packageRoot, "lib/verify-service.mjs"),
   )
   await writeManifest(packageRoot)
-  return { installRoot, packageRoot, path: `${bin}:/usr/bin:/bin`, root }
+  return { bin, installRoot, packageRoot, path: `${bin}:/usr/bin:/bin`, root }
 }
 
 export async function createPackagingFixture() {
