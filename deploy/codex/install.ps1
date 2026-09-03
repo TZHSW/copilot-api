@@ -60,8 +60,9 @@ function Wait-ApiReady([int]$PortNumber, [int]$TimeoutSeconds = 30) {
   while ([DateTime]::UtcNow -lt $deadline) {
     try {
       $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$PortNumber/" -TimeoutSec 1
-      if ($response.StatusCode -eq 200 -and $response.Content -eq "Server running") { return $true }
-      $lastFailure = "HTTP $($response.StatusCode): $($response.Content)"
+      $content = if ($response.Content -is [byte[]]) { [Text.Encoding]::UTF8.GetString($response.Content) } else { [string]$response.Content }
+      if ($response.StatusCode -eq 200 -and $content -eq "Server running") { return $true }
+      $lastFailure = "HTTP $($response.StatusCode): $content"
     } catch { $lastFailure = $_.Exception.Message }
     Start-Sleep -Milliseconds 250
   }
