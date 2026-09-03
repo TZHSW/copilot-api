@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url"
  * @property {string} home
  * @property {string} platform
  * @property {number} port
+ * @property {boolean} [skipBackup]
  * @property {string} source
  * @property {string} target
  */
@@ -255,6 +256,24 @@ async function validateTreePaths(root) {
   }
 }
 
+/** @param {string} root */
+async function validateRootPath(root) {
+  try {
+    if ((await lstat(root)).isSymbolicLink()) {
+      throw new Error(`symbolic link outside migration roots: ${root}`)
+    }
+  } catch (error) {
+    if (
+      error !== null
+      && typeof error === "object"
+      && "code" in error
+      && error.code === "ENOENT"
+    )
+      return
+    throw error
+  }
+}
+
 /**
  * @param {string} path
  * @param {string} root
@@ -340,6 +359,19 @@ function excludedPortablePath(path) {
   )
 }
 
+/** @param {string} path */
+function excludedBackupPath(path) {
+  const managedRoot = path.split("/", 1)[0]
+  return ![
+    "auth.json",
+    "config.toml",
+    "hooks.json",
+    "hooks.linux.json",
+    "plugins",
+    "skills",
+  ].includes(managedRoot)
+}
+
 /** @param {MigrationOptions} options */
 // eslint-disable-next-line complexity -- Optional inputs are validated before one atomic migration.
 export async function migrateConfig(options) {
@@ -348,7 +380,17 @@ export async function migrateConfig(options) {
   }
   validateSeparateRoots([options.source, options.target, options.backup])
   await validateTreePaths(options.source)
-  await validateTreePaths(options.target)
+  await validateRootPath(options.target)
+  for (const managedPath of [
+    "auth.json",
+    "config.toml",
+    "hooks.json",
+    "hooks.linux.json",
+    "plugins",
+    "skills",
+  ]) {
+    await validateTreePaths(join(options.target, managedPath))
+  }
   await validateTreePaths(options.backup)
 
   const sourceConfig = join(options.source, "config.toml")
@@ -380,8 +422,14 @@ export async function migrateConfig(options) {
     if (options.platform === "win32") linuxHooksContents = rawHooks
   }
 
-  if (!options.dryRun && (await exists(options.target))) {
-    await mergeTree(options.target, options.backup)
+  if (
+    !options.dryRun
+    && !options.skipBackup
+    && (await exists(options.target))
+  ) {
+    await mergeTree(options.target, options.backup, {
+      exclude: excludedBackupPath,
+    })
   }
 
   /** @type {Array<string>} */
@@ -435,7 +483,7 @@ export async function migrateConfig(options) {
 /** @param {Array<string>} args */
 function parseCliArguments(args) {
   /** @type {Record<string, string | number | boolean | undefined>} */
-  const options = { dryRun: false }
+  const options = { dryRun: false, skipBackup: false }
   const names = new Set([
     "source",
     "target",
@@ -449,6 +497,10 @@ function parseCliArguments(args) {
     const argument = args[index]
     if (argument === "--dry-run") {
       options.dryRun = true
+      continue
+    }
+    if (argument === "--skip-backup") {
+      options.skipBackup = true
       continue
     }
     if (!argument.startsWith("--") || !names.has(argument.slice(2))) {
