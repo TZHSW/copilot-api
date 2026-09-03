@@ -249,7 +249,7 @@ function Restore-Installation {
   }
   if ($PreviousRunning) {
     Write-Host "Rollback: starting previous controller"
-    if (Test-Path $Ctl) { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Ctl start | Out-Null }
+    if (Test-Path $Ctl) { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Ctl start }
     else { Write-Warning "Previous controller was not restored; service cannot be restarted" }
     Write-Host "Rollback: waiting for previous API"
     if (-not (Wait-ApiReady $Port)) { Write-Warning "Previous service was restored but did not become ready on port $Port" }
