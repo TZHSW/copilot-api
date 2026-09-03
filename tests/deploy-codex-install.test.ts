@@ -112,6 +112,9 @@ describe("portable Linux installer", () => {
       SUPERVISOR: "nohup",
     })
 
+    if (result.exitCode !== 0) {
+      throw new Error(`installer failed:\n${result.stdout}\n${result.stderr}`)
+    }
     expect(result.exitCode).toBe(0)
     expect(result.stdout).toContain("安装完成")
     expect(
@@ -268,7 +271,13 @@ describe("portable Linux installer validation and recovery", () => {
       PORT: String(port),
       SUPERVISOR: "nohup",
     }
-    expect((await runInstaller(environment)).exitCode).toBe(0)
+    const initialInstall = await runInstaller(environment)
+    if (initialInstall.exitCode !== 0) {
+      throw new Error(
+        `initial installer failed:\n${initialInstall.stdout}\n${initialInstall.stderr}`,
+      )
+    }
+    expect(initialInstall.exitCode).toBe(0)
 
     const installedMain = join(
       fixture.installRoot,

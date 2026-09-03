@@ -95,7 +95,9 @@ export async function createCompleteInstallerFixture() {
   const installRoot = join(root, "install")
   const bin = join(root, "bin")
   await mkdir(bin, { recursive: true })
-  await symlink(process.execPath, join(bin, "node"))
+  const node = Bun.which("node")
+  if (!node) throw new Error("Node.js is required for installer tests")
+  await symlink(node, join(bin, "node"))
   await writeFixture(join(bin, "codex"), "#!/bin/sh\necho codex-cli fixture\n")
   await chmod(join(bin, "codex"), 0o755)
   await writeFixture(
