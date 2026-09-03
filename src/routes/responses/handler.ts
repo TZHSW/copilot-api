@@ -1,55 +1,107 @@
 import type { Context } from "hono"
 
 import consola from "consola"
-import { streamSSE, type SSEMessage } from "hono/streaming"
 
 import { awaitApproval } from "~/lib/approval"
 import { checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
 import {
-  createResponses,
+  proxyResponses,
   type ResponsesPayload,
 } from "~/services/copilot/create-responses"
+
+const RESPONSES_PATH = /^\/(?:v1\/)?responses/
+const UNSUPPORTED_OPTIONAL_TOOLS = new Set(["image_generation"])
+
+export function prepareResponsesPayload(payload: ResponsesPayload): {
+  payload: ResponsesPayload
+  removedToolTypes: Array<string>
+} {
+  if (!Array.isArray(payload.tools)) {
+    return { payload, removedToolTypes: [] }
+  }
+
+  const toolChoice = payload.tool_choice
+  const explicitlySelectedType =
+    (
+      typeof toolChoice === "object"
+      && toolChoice !== null
+      && typeof (toolChoice as { type?: unknown }).type === "string"
+    ) ?
+      (toolChoice as { type: string }).type
+    : undefined
+  const removedToolTypes: Array<string> = []
+  const tools = (payload.tools as Array<unknown>).filter((tool) => {
+    if (typeof tool !== "object" || tool === null) return true
+    const type = (tool as { type?: unknown }).type
+    if (typeof type !== "string") return true
+    if (
+      !UNSUPPORTED_OPTIONAL_TOOLS.has(type)
+      || explicitlySelectedType === type
+    ) {
+      return true
+    }
+    removedToolTypes.push(type)
+    return false
+  })
+
+  return {
+    payload: { ...payload, tools },
+    removedToolTypes,
+  }
+}
 
 export async function handleResponses(c: Context) {
   await checkRateLimit(state)
 
-  const payload = await c.req.json<ResponsesPayload>()
+  const requestUrl = new URL(c.req.url)
+  const suffix = requestUrl.pathname.replace(RESPONSES_PATH, "")
+  const path = `/responses${suffix}`
+  const hasBody = !["DELETE", "GET", "HEAD"].includes(c.req.method)
+  let payload: ResponsesPayload | undefined
 
-  // Strip tools the Copilot Responses backend does not support
-  // (e.g. Codex CLI injects `image_generation` by default).
-  // Allowlist what we know Copilot accepts: function, mcp, web_search.
-  if (Array.isArray(payload.tools)) {
-    const allowed = new Set(["function", "mcp", "web_search"])
-    const before = payload.tools.length
-    payload.tools = (payload.tools as Array<{ type?: string }>).filter((t) =>
-      allowed.has(t.type ?? ""),
-    )
-    if (payload.tools.length !== before) {
-      consola.debug(
-        `Filtered ${before - payload.tools.length} unsupported tool(s)`,
-      )
+  if (hasBody) {
+    const rawBody = await c.req.text()
+    if (rawBody.trim()) {
+      try {
+        payload = JSON.parse(rawBody) as ResponsesPayload
+      } catch {
+        return c.json(
+          {
+            error: {
+              message: "Request body must be valid JSON.",
+              type: "invalid_request_error",
+            },
+          },
+          400,
+        )
+      }
+
+      const prepared = prepareResponsesPayload(payload)
+      payload = prepared.payload
+      if (prepared.removedToolTypes.length > 0) {
+        consola.debug(
+          `Filtered optional Copilot-incompatible tools: ${prepared.removedToolTypes.join(", ")}`,
+        )
+      }
     }
   }
 
-  consola.debug("Responses payload:", JSON.stringify(payload).slice(-400))
-
   if (state.manualApprove) await awaitApproval()
 
-  const response = await createResponses(payload)
+  const response = await proxyResponses(payload, {
+    method: c.req.method,
+    path,
+    search: requestUrl.search,
+    signal: c.req.raw.signal,
+  })
+  const headers = new Headers(response.headers)
+  headers.delete("content-encoding")
+  headers.delete("content-length")
 
-  if (isAsyncIterable(response)) {
-    consola.debug("Streaming response")
-    return streamSSE(c, async (stream) => {
-      for await (const chunk of response) {
-        await stream.writeSSE(chunk as SSEMessage)
-      }
-    })
-  }
-
-  consola.debug("Non-streaming response")
-  return c.json(response)
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  })
 }
-
-const isAsyncIterable = (value: unknown): value is AsyncIterable<unknown> =>
-  typeof value === "object" && value !== null && Symbol.asyncIterator in value

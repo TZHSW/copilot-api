@@ -39,7 +39,8 @@ export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
 
   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
-  consola.info("Anthropic request: model=%s thinking=%s output_config=%s",
+  consola.info(
+    "Anthropic request: model=%s thinking=%s output_config=%s",
     anthropicPayload.model,
     JSON.stringify(anthropicPayload.thinking),
     JSON.stringify(anthropicPayload.output_config),
@@ -66,7 +67,8 @@ export async function handleCompletion(c: Context) {
   }
 
   const openAIPayload = translateToOpenAI(anthropicPayload)
-  consola.info("Translated OpenAI: model=%s reasoning_effort=%s",
+  consola.info(
+    "Translated OpenAI: model=%s reasoning_effort=%s",
     openAIPayload.model,
     openAIPayload.reasoning_effort ?? "NOT SET",
   )
@@ -156,11 +158,11 @@ async function handleViaResponses(
     await awaitApproval()
   }
 
-  const response = await createResponses(responsesPayload)
+  const response = await createResponses(responsesPayload, c.req.raw.signal)
 
-  if (!(typeof response === "object" && Symbol.asyncIterator in response)) {
+  if (typeof response !== "object" || !(Symbol.asyncIterator in response)) {
     const anthropicResponse = translateResponsesResultToAnthropic(
-      response as Record<string, unknown>,
+      response,
       anthropicPayload.model,
     )
     return c.json(anthropicResponse)
@@ -185,9 +187,11 @@ async function handleViaResponses(
         anthropicPayload.model,
       )
       for (const event of events) {
-        await stream.writeSSE({ event: event.type, data: JSON.stringify(event) })
+        await stream.writeSSE({
+          event: event.type,
+          data: JSON.stringify(event),
+        })
       }
     }
   })
 }
-
