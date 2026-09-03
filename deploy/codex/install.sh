@@ -217,6 +217,21 @@ EOF
   loginctl enable-linger "$USER" >/dev/null 2>&1 || warn "无法启用 linger，注销后服务可能停止"
 }
 
+install_cron_reboot() {
+  [ -z "${INSTALL_ROOT:-}" ] || return 0
+  if ! command -v crontab >/dev/null 2>&1; then
+    warn "没有 crontab；重启后请手动运行 $CTL start"
+    return 0
+  fi
+  local line="@reboot $CTL start"
+  if crontab -l 2>/dev/null | grep -Fqx "$line"; then return 0; fi
+  if { crontab -l 2>/dev/null || true; printf '%s\n' "$line"; } | crontab -; then
+    echo "已添加 crontab @reboot 自启"
+  else
+    warn "无法写入 crontab；重启后请手动运行 $CTL start"
+  fi
+}
+
 say "安装前检查"
 validate_target "$USER_HOME"
 validate_target "$CODEX_HOME"
@@ -281,13 +296,16 @@ mkdir -p "$TOKEN_DIR"
 install -m 600 "$PACKAGE_ROOT/credentials/github_token" "$TOKEN_FILE"
 
 say "迁移 Codex 配置"
+MIGRATION_RESULT=$BACKUP/migration-result.json
 "$NODE_BIN" "$PACKAGE_ROOT/lib/migrate-config.mjs" \
   --source "$PACKAGE_ROOT/codex-config" \
   --target "$CODEX_HOME" \
   --home "$USER_HOME" \
   --port "$PORT" \
   --platform linux \
-  --backup "$BACKUP/migration"
+  --backup "$BACKUP/migration" >"$MIGRATION_RESULT"
+MIGRATED_COUNT=$("$NODE_BIN" -e 'const f=require("node:fs");console.log(JSON.parse(f.readFileSync(process.argv[1],"utf8")).changed.length)' "$MIGRATION_RESULT")
+echo "已迁移 $MIGRATED_COUNT 个配置文件"
 if [ -d "$PACKAGE_ROOT/optional-config/orca-agent-hooks" ]; then
   mkdir -p "$USER_HOME/.orca/agent-hooks"
   cp -a "$PACKAGE_ROOT/optional-config/orca-agent-hooks/." "$USER_HOME/.orca/agent-hooks/"
@@ -318,6 +336,7 @@ done
 VERIFY_ARGS=(--base-url "http://127.0.0.1:$PORT" --managed-root "$SHARE")
 if [ "$OFFLINE" = 1 ]; then VERIFY_ARGS+=(--offline); fi
 "$NODE_BIN" "$SHARE/lib/verify-service.mjs" "${VERIFY_ARGS[@]}"
+if [ "$ACTIVE_SUPERVISOR" = nohup ]; then install_cron_reboot; fi
 
 trap - ERR INT TERM
 MUTATED=0

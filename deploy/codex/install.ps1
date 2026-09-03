@@ -245,8 +245,10 @@ try {
   Copy-Item -LiteralPath (Join-Path $PackageRoot "credentials\github_token") -Destination $TokenFile -Force
 
   Write-Step "Migrate Codex configuration"
-  & $Node (Join-Path $PackageRoot "lib\migrate-config.mjs") --source (Join-Path $PackageRoot "codex-config") --target $CodexHome --home $UserHome --port $Port --platform win32 --backup (Join-Path $Backup "migration")
+  $migrationJson = & $Node (Join-Path $PackageRoot "lib\migrate-config.mjs") --source (Join-Path $PackageRoot "codex-config") --target $CodexHome --home $UserHome --port $Port --platform win32 --backup (Join-Path $Backup "migration")
   if ($LASTEXITCODE -ne 0) { throw "Configuration migration failed" }
+  $migration = $migrationJson | ConvertFrom-Json
+  Write-Host "Migrated $($migration.changed.Count) configuration files"
 
   Write-Step "Configure background service"
   Write-Controller $Node
