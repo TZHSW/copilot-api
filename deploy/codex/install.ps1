@@ -85,7 +85,9 @@ function Stop-ManagedService {
   if (Test-Path $Ctl) {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Ctl stop | Out-Null
   }
-  & schtasks.exe /End /TN $TaskName 2>$null | Out-Null
+  if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+  }
   $owner = Get-PortOwner $Port
   if ($owner -and (Test-ManagedOwner $owner)) {
     Stop-Process -Id ([int]$owner.OwningProcess) -Force -ErrorAction SilentlyContinue
@@ -227,9 +229,13 @@ function Restore-Installation {
   Restore-Path $CodexHome "codex"
   Restore-Path $TokenFile "github_token"
   Restore-Path $Ctl "controller"
-  & schtasks.exe /Delete /TN $TaskName /F 2>$null | Out-Null
+  if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+  }
   $taskXml = Join-Path $Backup "scheduled-task.xml"
-  if (Test-Path $taskXml) { & schtasks.exe /Create /TN $TaskName /XML $taskXml /F | Out-Null }
+  if (Test-Path $taskXml) {
+    Register-ScheduledTask -TaskName $TaskName -Xml (Get-Content -LiteralPath $taskXml -Raw) -Force | Out-Null
+  }
   if ($PreviousRunning) {
     if (Test-Path $Ctl) { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Ctl start | Out-Null }
     else { Write-Warning "Previous controller was not restored; service cannot be restarted" }
@@ -278,8 +284,9 @@ Backup-Path $Share "api"
 Backup-Path $CodexHome "codex"
 Backup-Path $TokenFile "github_token"
 Backup-Path $Ctl "controller"
-if ((& schtasks.exe /Query /TN $TaskName 2>$null) -and $LASTEXITCODE -eq 0) {
-  & schtasks.exe /Query /TN $TaskName /XML 2>$null | Set-Content -LiteralPath (Join-Path $Backup "scheduled-task.xml") -Encoding Unicode
+$existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if ($existingTask) {
+  Export-ScheduledTask -TaskName $TaskName | Set-Content -LiteralPath (Join-Path $Backup "scheduled-task.xml") -Encoding Unicode
 }
 try {
   $Mutated = $true
