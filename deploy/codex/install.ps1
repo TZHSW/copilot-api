@@ -4,6 +4,7 @@ param(
   [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }),
   [switch]$Offline,
   [string]$BackupDir,
+  [switch]$SkipBackup,
   [switch]$NoScheduledTask,
   [string]$InstallRoot,
   [switch]$DryRun,
@@ -25,6 +26,7 @@ $BackupRoot = if ($BackupDir) { $BackupDir } else { $DefaultBackupRoot }
 $Backup = Join-Path $BackupRoot ((Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ") + "-" + $PID)
 $Mutated = $false
 $PreviousRunning = $false
+$CodexManagedPaths = @("config.toml", "auth.json", "hooks.json", "hooks.linux.json", "skills", "plugins")
 
 function Write-Step([string]$Message) {
   Write-Host "`n==> $Message" -ForegroundColor Cyan
@@ -106,8 +108,15 @@ function Stop-ManagedService {
 
 function Backup-Path([string]$Source, [string]$Name) {
   if (Test-Path $Source) {
-    New-Item -ItemType Directory -Force -Path $Backup | Out-Null
-    Copy-Item -LiteralPath $Source -Destination (Join-Path $Backup $Name) -Recurse -Force
+    $destination = Join-Path $Backup $Name
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+    Copy-Item -LiteralPath $Source -Destination $destination -Recurse -Force
+  }
+}
+
+function Backup-CodexHome {
+  foreach ($relative in $CodexManagedPaths) {
+    Backup-Path (Join-Path $CodexHome $relative) (Join-Path "codex" $relative)
   }
 }
 
@@ -117,6 +126,12 @@ function Restore-Path([string]$Destination, [string]$Name) {
   if (Test-Path $saved) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Destination) | Out-Null
     Copy-Item -LiteralPath $saved -Destination $Destination -Recurse -Force
+  }
+}
+
+function Restore-CodexHome {
+  foreach ($relative in $CodexManagedPaths) {
+    Restore-Path (Join-Path $CodexHome $relative) (Join-Path "codex" $relative)
   }
 }
 
@@ -236,7 +251,7 @@ function Restore-Installation {
   try { Stop-ManagedService } catch { Write-Warning $_.Exception.Message }
   Write-Host "Rollback: restoring files"
   Restore-Path $Share "api"
-  Restore-Path $CodexHome "codex"
+  Restore-CodexHome
   Restore-Path $TokenFile "github_token"
   Restore-Path $Ctl "controller"
   Write-Host "Rollback: restoring scheduled task"
@@ -293,14 +308,18 @@ if ($DryRun) {
 }
 
 Write-Step "Backup"
-New-Item -ItemType Directory -Force -Path $Backup | Out-Null
-Backup-Path $Share "api"
-Backup-Path $CodexHome "codex"
-Backup-Path $TokenFile "github_token"
-Backup-Path $Ctl "controller"
-$existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if ($existingTask) {
-  Export-ScheduledTask -TaskName $TaskName | Set-Content -LiteralPath (Join-Path $Backup "scheduled-task.xml") -Encoding Unicode
+if ($SkipBackup) {
+  Write-Warning "Backup disabled; failed installation changes cannot be rolled back"
+} else {
+  New-Item -ItemType Directory -Force -Path $Backup | Out-Null
+  Backup-Path $Share "api"
+  Backup-CodexHome
+  Backup-Path $TokenFile "github_token"
+  Backup-Path $Ctl "controller"
+  $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+  if ($existingTask) {
+    Export-ScheduledTask -TaskName $TaskName | Set-Content -LiteralPath (Join-Path $Backup "scheduled-task.xml") -Encoding Unicode
+  }
 }
 try {
   $Mutated = $true
@@ -318,7 +337,9 @@ try {
   Copy-Item -LiteralPath (Join-Path $PackageRoot "credentials\github_token") -Destination $TokenFile -Force
 
   Write-Step "Migrate Codex configuration"
-  $migrationJson = & $Node (Join-Path $PackageRoot "lib\migrate-config.mjs") --source (Join-Path $PackageRoot "codex-config") --target $CodexHome --home $UserHome --port $Port --platform win32 --backup (Join-Path $Backup "migration")
+  $migrationArguments = @((Join-Path $PackageRoot "lib\migrate-config.mjs"), "--source", (Join-Path $PackageRoot "codex-config"), "--target", $CodexHome, "--home", $UserHome, "--port", $Port, "--platform", "win32", "--backup", (Join-Path $Backup "migration"))
+  if ($SkipBackup) { $migrationArguments += "--skip-backup" }
+  $migrationJson = & $Node $migrationArguments
   if ($LASTEXITCODE -ne 0) { throw "Configuration migration failed" }
   $migration = $migrationJson | ConvertFrom-Json
   Write-Host "Migrated $($migration.changed.Count) configuration files"
@@ -350,10 +371,15 @@ try {
       Get-Content -LiteralPath $logFile -Tail 30 | ForEach-Object { Write-Warning $_ }
     }
   }
-  if ($Mutated) { Restore-Installation }
+  if ($Mutated -and $SkipBackup) {
+    Write-Warning "Installation failed after backup was skipped; stopping replacement service without rollback"
+    try { Stop-ManagedService } catch { Write-Warning $_.Exception.Message }
+  } elseif ($Mutated) {
+    Restore-Installation
+  }
   throw $installError
 }
 
 Write-Host "`nInstallation complete: API=http://localhost:$Port/v1 Codex=$CodexHome" -ForegroundColor Green
-Write-Host "Backup: $Backup"
+if ($SkipBackup) { Write-Host "Backup: skipped" } else { Write-Host "Backup: $Backup" }
 Write-Host "Control: powershell.exe -File `"$Ctl`" status|restart|stop|log"

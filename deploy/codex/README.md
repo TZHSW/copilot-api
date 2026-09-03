@@ -41,6 +41,8 @@ cd .\copilot-codex-*
 
 省略 `-Offline` 会运行在线端到端验证。换端口使用 `.\install.ps1 -Port 4142`。安装器创建当前用户的 `CopilotApiPatched` 登录计划任务，不需要管理员权限。
 
+如果明确不需要失败回滚，可使用 `.\install.ps1 -SkipBackup`。该模式不会创建任何备份；安装失败后只停止替换服务，不恢复旧 API 或 Codex 配置。
+
 服务管理脚本位于：
 
 ```powershell
@@ -58,9 +60,9 @@ cd .\copilot-codex-*
 - 合并 skills/plugins，同名文件以包内快照为准；
 - 重写本地 API/MCP 端口；
 - 删除属于源机器的项目信任路径；
-- 不迁移 sessions、history、日志和 SQLite 状态。
+- 不扫描、备份或迁移 `.tmp`、`packages`、sessions、history、日志和 SQLite 状态。
 
-Linux 备份位于 `~/.local/share/copilot-codex-backups/`。Windows 备份位于 `%LOCALAPPDATA%\copilot-codex-backups\`。本地安装失败时自动恢复；成功安装的备份仍会保留。
+Linux 备份位于 `~/.local/share/copilot-codex-backups/`。Windows 备份位于 `%LOCALAPPDATA%\copilot-codex-backups\`。Windows 只备份安装器实际修改的 Codex 配置、skills 和 plugins，不会复制运行中的数据库或临时缓存。本地安装失败时自动恢复；成功安装的备份仍会保留。
 
 手动恢复时，先停止 API，选择对应时间戳目录，把其中的 `api`、`codex`、`github_token` 和 `controller` 复制回原位置，再重新启动旧控制脚本。Linux systemd 安装还需复制 `systemd-unit` 到 `~/.config/systemd/user/copilot-api.service`，运行 `systemctl --user daemon-reload && systemctl --user enable --now copilot-api.service`。Windows 若备份包含 `scheduled-task.xml`，可运行：
 

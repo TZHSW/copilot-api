@@ -16,6 +16,7 @@ interface MigrationOptions {
   home: string
   platform: string
   port: number
+  skipBackup?: boolean
   source: string
   target: string
 }
@@ -149,6 +150,7 @@ support_path = "__CODEX_HOME__/.orca/hooks"
   })
 })
 
+// eslint-disable-next-line max-lines-per-function -- Migration behavior is grouped as one integration suite.
 describe("Codex configuration migration", () => {
   test("merge results are deterministic regardless of source creation order", async () => {
     const { source, target } = await makeTempTree()
@@ -208,6 +210,78 @@ base_url = "http://localhost:4141/v1"
     expect(await Bun.file(`${target}/config.toml`).text()).toContain(
       'base_url = "http://localhost:5151/v1"',
     )
+  })
+
+  test("does not duplicate transient .tmp state into migration backups", async () => {
+    const { backup, source, target } = await makeTempTree()
+    const transient = `${target}/.tmp/plugins/plugins/nvidia/skills/omniverse-cad-to-simready/references/simready-conform-profile/references/FET_004_SIMULATE_MULTI_BODY_PHYSICS/scripts/check_dependencies.py`
+    await writeFixture(transient, "transient")
+    await writeFixture(
+      `${source}/config.toml`,
+      '[model_providers.copilot]\nbase_url = "http://localhost:4141/v1"\n',
+    )
+
+    await migration.migrateConfig({
+      backup,
+      home: target,
+      platform: "win32",
+      port: 4141,
+      source,
+      target,
+    })
+
+    expect(await pathExists(transient)).toBe(true)
+    expect(await pathExists(`${backup}/.tmp`)).toBe(false)
+  })
+
+  test("does not inspect or back up Codex runtime state", async () => {
+    const { backup, root, source, target } = await makeTempTree()
+    const outsidePackage = `${root}/standalone-package`
+    const packageLink = `${target}/packages/standalone/current`
+    const database = `${target}/sqlite/codex-dev.db`
+    await mkdir(outsidePackage, { recursive: true })
+    await mkdir(`${target}/packages/standalone`, { recursive: true })
+    await symlink(outsidePackage, packageLink, "dir")
+    await writeFixture(database, "live database")
+    await writeFixture(
+      `${source}/config.toml`,
+      '[model_providers.copilot]\nbase_url = "http://localhost:4141/v1"\n',
+    )
+
+    await migration.migrateConfig({
+      backup,
+      home: target,
+      platform: "win32",
+      port: 4141,
+      source,
+      target,
+    })
+
+    expect(await pathExists(packageLink)).toBe(true)
+    expect(await Bun.file(database).text()).toBe("live database")
+    expect(await pathExists(`${backup}/packages`)).toBe(false)
+    expect(await pathExists(`${backup}/sqlite`)).toBe(false)
+  })
+
+  test("can explicitly skip the configuration backup", async () => {
+    const { backup, source, target } = await makeTempTree()
+    await writeFixture(`${target}/config.toml`, "old config")
+    await writeFixture(
+      `${source}/config.toml`,
+      '[model_providers.copilot]\nbase_url = "http://localhost:4141/v1"\n',
+    )
+
+    await migration.migrateConfig({
+      backup,
+      home: target,
+      platform: "win32",
+      port: 4141,
+      skipBackup: true,
+      source,
+      target,
+    })
+
+    expect(await pathExists(backup)).toBe(false)
   })
 
   test("dry-run reports changes without mutating the target or creating a backup", async () => {

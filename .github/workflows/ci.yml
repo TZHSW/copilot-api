@@ -82,7 +82,16 @@ jobs:
             if ($content -is [byte[]]) { return [Text.Encoding]::UTF8.GetString($content) }
             return [string]$content
           }
+          $deepCache = Join-Path $target ".codex\.tmp\plugins\plugins\nvidia\skills\omniverse-cad-to-simready\references\simready-conform-profile\references\FET_004_SIMULATE_MULTI_BODY_PHYSICS\scripts\check_dependencies.py"
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $deepCache) | Out-Null
+          Set-Content -LiteralPath $deepCache -Value "transient cache"
+          $database = Join-Path $target ".codex\sqlite\codex-dev.db"
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $database) | Out-Null
+          Set-Content -LiteralPath $database -Value "live database"
+          $databaseStream = [IO.File]::Open($database, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
           .\deploy\codex\install.ps1 -PackageRoot $package -InstallRoot $target -CodexHome "$target\.codex" -Port 54142 -Offline -NoScheduledTask
+          if (-not (Test-Path -LiteralPath $deepCache)) { throw "installer removed transient Codex cache" }
+          if (-not (Test-Path -LiteralPath $database)) { throw "installer removed Codex database" }
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ctl status
           if ((Get-ResponseText "http://127.0.0.1:54142/") -ne "Server running") { throw "fixture API failed" }
 
@@ -101,10 +110,13 @@ jobs:
             if (-not $failed) { throw "upgrade failure injection did not fail" }
             if ((Get-ResponseText "http://127.0.0.1:54142/") -ne "Server running") { throw "rollback did not restore the API" }
             if ((Get-ScheduledTask -TaskName "CopilotApiPatched").State -ne "Disabled") { throw "rollback did not restore disabled task state" }
+            if (-not (Test-Path -LiteralPath $deepCache)) { throw "rollback removed transient Codex cache" }
+            if (-not (Test-Path -LiteralPath $database)) { throw "rollback removed Codex database" }
           } finally {
             Remove-Item Env:INSTALL_FAIL_AFTER_STOP -ErrorAction SilentlyContinue
             Unregister-ScheduledTask -TaskName "CopilotApiPatched" -Confirm:$false -ErrorAction SilentlyContinue
           }
+          $databaseStream.Dispose()
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ctl stop
 
           $foreign = Start-Process powershell.exe -ArgumentList "-NoProfile -Command Start-Sleep -Seconds 30" -PassThru
@@ -116,6 +128,12 @@ jobs:
           } finally {
             if (-not $foreign.HasExited) { Stop-Process -Id $foreign.Id -Force }
           }
+
+          $skipTarget = Join-Path $env:RUNNER_TEMP "portable target without backup"
+          $skipCtl = Join-Path $skipTarget "AppData\Local\Programs\copilot-api-ctl.ps1"
+          .\deploy\codex\install.ps1 -PackageRoot $package -InstallRoot $skipTarget -CodexHome "$skipTarget\.codex" -Port 54143 -Offline -NoScheduledTask -SkipBackup
+          if (Test-Path "$skipTarget\AppData\Local\copilot-codex-backups") { throw "SkipBackup created a backup" }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $skipCtl stop
 
   test:
     runs-on: ubuntu-latest
