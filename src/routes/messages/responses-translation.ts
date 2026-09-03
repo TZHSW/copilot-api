@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-unnecessary-condition, complexity, eqeqeq, max-depth, max-lines-per-function, no-nested-ternary, unicorn/consistent-function-scoping -- Protocol translation mirrors nested Anthropic and Responses event grammars. */
 // Anthropic Messages <-> OpenAI Responses translation.
 //
 // Why this exists: Copilot's GPT-5.x models (gpt-5.5, gpt-5.4, ...) are
@@ -55,7 +56,12 @@ function reasoningFromPayload(
   }
   if (payload.thinking?.type === "enabled" && payload.thinking.budget_tokens) {
     const b = payload.thinking.budget_tokens
-    return { effort: b >= 8000 ? "high" : b >= 2000 ? "medium" : "low" }
+    return {
+      effort:
+        b >= 8000 ? "high"
+        : b >= 2000 ? "medium"
+        : "low",
+    }
   }
   return undefined
 }
@@ -163,7 +169,8 @@ export function translateAnthropicToResponses(
             }
             output =
               texts.length > 0 ? texts.join("\n")
-              : imageCount > 0 ? "[image returned by tool — see attached image below]"
+              : imageCount > 0 ?
+                "[image returned by tool — see attached image below]"
               : JSON.stringify(block.content)
           }
           input.push({
@@ -260,7 +267,7 @@ export function translateResponsesResultToAnthropic(
       }
     } else if (item.type === "function_call") {
       hasToolUse = true
-      let parsed: Record<string, unknown> = {}
+      let parsed: Record<string, unknown>
       try {
         parsed = JSON.parse(item.arguments || "{}") as Record<string, unknown>
       } catch {
@@ -286,7 +293,10 @@ export function translateResponsesResultToAnthropic(
     role: "assistant",
     content,
     model: requestedModel,
-    stop_reason: maxedOut ? "max_tokens" : hasToolUse ? "tool_use" : "end_turn",
+    stop_reason:
+      maxedOut ? "max_tokens"
+      : hasToolUse ? "tool_use"
+      : "end_turn",
     stop_sequence: null,
     usage: {
       input_tokens: usage.input_tokens ?? 0,
@@ -445,11 +455,10 @@ export function translateResponsesStreamEvent(
         {
           type: "message_delta",
           delta: {
-            stop_reason: incomplete
-              ? "max_tokens"
-              : state.hadToolCall
-                ? "tool_use"
-                : "end_turn",
+            stop_reason:
+              incomplete ? "max_tokens"
+              : state.hadToolCall ? "tool_use"
+              : "end_turn",
             stop_sequence: null,
           },
           usage: {
