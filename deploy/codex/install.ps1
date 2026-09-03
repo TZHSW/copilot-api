@@ -244,7 +244,8 @@ Assert-SafeTarget $CodexHome
 Assert-SafeTarget $Share
 $Node = Assert-Command "node" "Node.js 20 or newer is required"
 $Codex = Assert-Command "codex" "Codex CLI is required; this installer does not download it"
-$nodeMajor = [int](& $Node -p 'Number(process.versions.node.split(".")[0])')
+$nodeVersion = (& $Node --version).Trim().TrimStart("v")
+$nodeMajor = [int]($nodeVersion.Split(".")[0])
 if ($nodeMajor -lt 20) { throw "Node.js 20 or newer is required" }
 & $Codex --version | Out-Null
 foreach ($required in @("dist\main.js", "lib\migrate-config.mjs", "lib\verify-service.mjs", "codex-config\config.toml", "codex-config\auth.json", "codex-config\hooks.json", "credentials\github_token")) {
