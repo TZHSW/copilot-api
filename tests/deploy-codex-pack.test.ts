@@ -9,7 +9,7 @@ import {
   runCommand,
 } from "./helpers/deploy-codex"
 
-async function buildFixturePackage() {
+async function buildFixturePackage({ realBuild = false } = {}) {
   const fixture = await createPackagingFixture()
   const out = await mkdtemp(join(tmpdir(), "copilot-codex-output-"))
   const result = await runCommand(
@@ -21,7 +21,7 @@ async function buildFixturePackage() {
         CODEX_HOME: fixture.codexHome,
         HOME: fixture.home,
         OUT_DIR: out,
-        PACK_TEST_DIST: fixture.dist,
+        PACK_TEST_DIST: realBuild ? undefined : fixture.dist,
       },
     },
   )
@@ -31,6 +31,7 @@ async function buildFixturePackage() {
   return {
     fixture,
     output: await extractAndHashGeneratedArchives(out),
+    stderr: result.stderr,
     stdout: result.stdout,
   }
 }
@@ -86,5 +87,13 @@ describe("portable credential-aware packer", () => {
     expect(config).not.toContain(fixture.home)
     expect(config).toContain("__CODEX_HOME__")
     expect(stdout).toContain("包含实时凭据")
+  }, 30_000)
+
+  test("does not try to install Git hooks while preparing dependencies", async () => {
+    const { stderr, stdout } = await buildFixturePackage({ realBuild: true })
+
+    expect(`${stdout}\n${stderr}`).not.toContain(
+      "Was not able to set git hooks",
+    )
   }, 30_000)
 })

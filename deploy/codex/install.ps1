@@ -25,8 +25,6 @@ $BackupRoot = if ($BackupDir) { $BackupDir } else { $DefaultBackupRoot }
 $Backup = Join-Path $BackupRoot ((Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ") + "-" + $PID)
 $Mutated = $false
 $PreviousRunning = $false
-$PreviousSupervisor = "none"
-$PreviousTask = $null
 
 function Write-Step([string]$Message) {
   Write-Host "`n==> $Message" -ForegroundColor Cyan
@@ -233,8 +231,8 @@ function Restore-Installation {
   $taskXml = Join-Path $Backup "scheduled-task.xml"
   if (Test-Path $taskXml) { & schtasks.exe /Create /TN $TaskName /XML $taskXml /F | Out-Null }
   if ($PreviousRunning) {
-    if ($PreviousSupervisor -eq "scheduled-task") { & schtasks.exe /Run /TN $TaskName 2>$null | Out-Null }
-    elseif ($PreviousSupervisor -eq "controller" -and (Test-Path $Ctl)) { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Ctl start | Out-Null }
+    if (Test-Path $Ctl) { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Ctl start | Out-Null }
+    else { Write-Warning "Previous controller was not restored; service cannot be restarted" }
     if (-not (Wait-ApiReady $Port)) { Write-Warning "Previous service was restored but did not become ready on port $Port" }
   }
 }
@@ -253,7 +251,6 @@ foreach ($required in @("dist\main.js", "lib\migrate-config.mjs", "lib\verify-se
   if (-not (Test-Path (Join-Path $PackageRoot $required))) { throw "Missing package file: $required" }
 }
 Verify-Manifest
-$PreviousTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 
 $owner = Get-PortOwner $Port
 if ($owner) {
@@ -261,9 +258,7 @@ if ($owner) {
     throw "Port $Port is owned by an unmanaged process (pid $($owner.OwningProcess)); refusing to stop it"
   }
   $PreviousRunning = $true
-  if ($PreviousTask) { $PreviousSupervisor = "scheduled-task" }
-  elseif (Test-Path $Ctl) { $PreviousSupervisor = "controller" }
-  else { throw "Existing managed API has no identifiable scheduled task or controller; refusing upgrade" }
+  if (-not (Test-Path $Ctl)) { throw "Existing managed API has no controller; refusing upgrade" }
 } elseif (Test-Port $Port) {
   throw "Port $Port answers but its owner cannot be verified; refusing to replace it"
 }
@@ -288,6 +283,7 @@ if ((& schtasks.exe /Query /TN $TaskName 2>$null) -and $LASTEXITCODE -eq 0) {
 try {
   $Mutated = $true
   if ($PreviousRunning) { Stop-ManagedService }
+  if ($env:INSTALL_FAIL_AFTER_STOP -eq "1") { throw "Injected failure after stopping previous service" }
   Write-Step "Deploy standalone API"
   $stage = "$Share.new.$PID"
   if (Test-Path $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }

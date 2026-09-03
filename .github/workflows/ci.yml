@@ -77,6 +77,26 @@ jobs:
           .\deploy\codex\install.ps1 -PackageRoot $package -InstallRoot $target -CodexHome "$target\.codex" -Port 54142 -Offline -NoScheduledTask
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ctl status
           if ((Invoke-WebRequest -UseBasicParsing http://127.0.0.1:54142/).Content -ne "Server running") { throw "fixture API failed" }
+
+          $taskAction = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c exit 0"
+          $taskTrigger = New-ScheduledTaskTrigger -AtLogOn
+          Register-ScheduledTask -TaskName "CopilotApiPatched" -Action $taskAction -Trigger $taskTrigger -Force | Out-Null
+          Disable-ScheduledTask -TaskName "CopilotApiPatched" | Out-Null
+          $env:INSTALL_FAIL_AFTER_STOP = "1"
+          try {
+            $failed = $false
+            try {
+              .\deploy\codex\install.ps1 -PackageRoot $package -InstallRoot $target -CodexHome "$target\.codex" -Port 54142 -Offline -NoScheduledTask
+            } catch {
+              $failed = $true
+            }
+            if (-not $failed) { throw "upgrade failure injection did not fail" }
+            if ((Invoke-WebRequest -UseBasicParsing http://127.0.0.1:54142/).Content -ne "Server running") { throw "rollback did not restore the API" }
+            if ((Get-ScheduledTask -TaskName "CopilotApiPatched").State -ne "Disabled") { throw "rollback did not restore disabled task state" }
+          } finally {
+            Remove-Item Env:INSTALL_FAIL_AFTER_STOP -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName "CopilotApiPatched" -Confirm:$false -ErrorAction SilentlyContinue
+          }
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ctl stop
 
           $foreign = Start-Process powershell.exe -ArgumentList "-NoProfile -Command Start-Sleep -Seconds 30" -PassThru

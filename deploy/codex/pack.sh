@@ -35,7 +35,7 @@ if [ -n "${PACK_TEST_DIST:-}" ]; then
   DIST=$(cd "$PACK_TEST_DIST" && pwd)
 else
   say "构建 standalone API"
-  bun install --frozen-lockfile
+  SKIP_INSTALL_SIMPLE_GIT_HOOKS=1 bun install --frozen-lockfile
   bun run build:standalone
   DIST=$REPO_DIR/dist-standalone
 fi
