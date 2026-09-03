@@ -7,6 +7,116 @@ on:
     types: [opened, synchronize, reopened]
 
 jobs:
+  powershell-parse:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Parse native Windows scripts
+        shell: powershell
+        run: |
+          $failed = $false
+          Get-ChildItem deploy/codex/*.ps1 | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | Format-List
+              $failed = $true
+            }
+          }
+          if ($failed) { throw "PowerShell parser errors" }
+
+      - name: Exercise Windows installer dry-run
+        shell: powershell
+        run: |
+          $package = Join-Path $env:RUNNER_TEMP "portable package"
+          $target = Join-Path $env:RUNNER_TEMP "portable target"
+          $bin = Join-Path $env:RUNNER_TEMP "fixture-bin"
+          New-Item -ItemType Directory -Force "$package\dist", "$package\lib", "$package\codex-config", "$package\credentials", $bin | Out-Null
+          Copy-Item deploy/codex/lib/*.mjs "$package\lib\"
+          @'
+          const http = require("node:http")
+          const args = process.argv.slice(2)
+          const port = Number(args[args.indexOf("--port") + 1])
+          const server = http.createServer((request, response) => {
+            if (request.url === "/") return response.end("Server running")
+            if (request.url.startsWith("/v1/models")) {
+              response.setHeader("content-type", "application/json")
+              return response.end(JSON.stringify({ object: "list", data: [{ id: "gpt-5.6-sol" }] }))
+            }
+            response.statusCode = 503
+            response.end("offline fixture")
+          })
+          server.listen(port, "127.0.0.1")
+          '@ | Set-Content "$package\dist\main.js"
+          Set-Content "$package\codex-config\config.toml" "[model_providers.copilot]`nbase_url = `"http://localhost:4141/v1`""
+          Set-Content "$package\codex-config\auth.json" "{}"
+          Set-Content "$package\codex-config\hooks.json" '{"hooks":{}}'
+          Set-Content "$package\credentials\github_token" "fixture-token"
+          Set-Content "$bin\codex.cmd" "@echo codex-cli fixture"
+          $env:PATH = "$bin;$env:PATH"
+          $root = [IO.Path]::GetFullPath($package).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+          $manifest = Get-ChildItem $package -Recurse -File | ForEach-Object {
+            $relative = $_.FullName.Substring($root.Length).Replace('\', '/')
+            "{0}  {1}" -f (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant(), $relative
+          }
+          Set-Content "$package\MANIFEST.sha256" ($manifest | Sort-Object)
+          .\deploy\codex\install.ps1 -PackageRoot $package -InstallRoot $target -CodexHome "$target\.codex" -Port 54141 -Offline -NoScheduledTask -DryRun
+
+      - name: Exercise Windows controller in a spaced path
+        timeout-minutes: 2
+        shell: powershell
+        run: |
+          $package = Join-Path $env:RUNNER_TEMP "portable package"
+          $target = Join-Path $env:RUNNER_TEMP "portable target"
+          $bin = Join-Path $env:RUNNER_TEMP "fixture-bin"
+          $env:PATH = "$bin;$env:PATH"
+          $ctl = Join-Path $target "AppData\Local\Programs\copilot-api-ctl.ps1"
+          function Get-ResponseText([string]$Uri) {
+            $content = (Invoke-WebRequest -UseBasicParsing $Uri).Content
+            if ($content -is [byte[]]) { return [Text.Encoding]::UTF8.GetString($content) }
+            return [string]$content
+          }
+          .\deploy\codex\install.ps1 -PackageRoot $package -InstallRoot $target -CodexHome "$target\.codex" -Port 54142 -Offline -NoScheduledTask
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ctl status
+          if ((Get-ResponseText "http://127.0.0.1:54142/") -ne "Server running") { throw "fixture API failed" }
+
+          $taskAction = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c exit 0"
+          $taskTrigger = New-ScheduledTaskTrigger -AtLogOn
+          Register-ScheduledTask -TaskName "CopilotApiPatched" -Action $taskAction -Trigger $taskTrigger -Force | Out-Null
+          Disable-ScheduledTask -TaskName "CopilotApiPatched" | Out-Null
+          $env:INSTALL_FAIL_AFTER_STOP = "1"
+          try {
+            $failed = $false
+            try {
+              .\deploy\codex\install.ps1 -PackageRoot $package -InstallRoot $target -CodexHome "$target\.codex" -Port 54142 -Offline -NoScheduledTask
+            } catch {
+              $failed = $true
+            }
+            if (-not $failed) { throw "upgrade failure injection did not fail" }
+            if ((Get-ResponseText "http://127.0.0.1:54142/") -ne "Server running") { throw "rollback did not restore the API" }
+            if ((Get-ScheduledTask -TaskName "CopilotApiPatched").State -ne "Disabled") { throw "rollback did not restore disabled task state" }
+          } finally {
+            Remove-Item Env:INSTALL_FAIL_AFTER_STOP -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName "CopilotApiPatched" -Confirm:$false -ErrorAction SilentlyContinue
+          }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ctl stop
+
+          $foreign = Start-Process powershell.exe -ArgumentList "-NoProfile -Command Start-Sleep -Seconds 30" -PassThru
+          try {
+            @{ Pid = $foreign.Id; StartTimeUtcTicks = $foreign.StartTime.ToUniversalTime().Ticks } | ConvertTo-Json -Compress | Set-Content "$target\AppData\Local\copilot-api-patched\run.pid"
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ctl stop
+            Start-Sleep -Milliseconds 200
+            if ($foreign.HasExited) { throw "controller killed an unrelated process" }
+          } finally {
+            if (-not $foreign.HasExited) { Stop-Process -Id $foreign.Id -Force }
+          }
+
   test:
     runs-on: ubuntu-latest
     steps:

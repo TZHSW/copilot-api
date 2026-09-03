@@ -13,13 +13,9 @@ export function translateModelName(model: string): string {
   const undated = model.replace(/-\d{8}$/, "")
 
   // Strip `[1m]` suffix — Copilot /v1/messages doesn't need it.
-  const base = undated.endsWith("[1m]")
-    ? undated.slice(0, -"[1m]".length)
-    : undated
+  const base =
+    undated.endsWith("[1m]") ? undated.slice(0, -"[1m]".length) : undated
 
   // Normalize hyphen form → dot form for the version number only.
-  return base.replace(
-    /^(claude-(?:opus|sonnet|haiku)-(\d+))-(\d+)/,
-    "$1.$3",
-  )
+  return base.replace(/^(claude-(?:opus|sonnet|haiku)-\d+)-(\d+)/, "$1.$2")
 }

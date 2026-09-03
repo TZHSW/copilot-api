@@ -8,10 +8,7 @@ import { cacheModels } from "~/lib/utils"
 // hardcoded capability registry recognizes the model ids.
 // e.g. claude-opus-4.7-1m-internal → claude-opus-4-7-1m-internal
 function toHyphenForm(id: string): string {
-  return id.replace(
-    /^(claude-(?:opus|sonnet|haiku)-(\d+))\.(\d+)/,
-    "$1-$3",
-  )
+  return id.replace(/^(claude-(?:opus|sonnet|haiku)-\d+)\.(\d+)/, "$1-$2")
 }
 
 export const modelRoutes = new Hono()

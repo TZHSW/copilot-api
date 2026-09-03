@@ -14,6 +14,7 @@ import { createNativeMessages } from "~/services/copilot/create-native-messages"
  * Only translates the model name; everything else forwarded as-is.
  * CC can use this by setting ANTHROPIC_BASE_URL to .../v1/native
  */
+// eslint-disable-next-line complexity -- Capability-specific payload filtering is intentionally centralized.
 export async function handleNativeMessages(c: Context) {
   await checkRateLimit(state)
 
@@ -60,7 +61,8 @@ export async function handleNativeMessages(c: Context) {
     }
   }
 
-  consola.info("Native request: model=%s stream=%s",
+  consola.info(
+    "Native request: model=%s stream=%s",
     payload.model,
     payload.stream ?? false,
   )
