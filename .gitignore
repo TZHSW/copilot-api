@@ -16,3 +16,6 @@ dist-standalone/
 
 # deploy tarballs
 copilot-cc-*.tar.gz
+
+# local agent worktrees
+.worktrees/
