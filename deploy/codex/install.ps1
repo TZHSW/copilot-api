@@ -232,11 +232,14 @@ Get-Content -LiteralPath $LogFile -Wait -Tail 50
 
 function Restore-Installation {
   Write-Warning "Installation failed; restoring $Backup"
+  Write-Host "Rollback: stopping replacement service"
   try { Stop-ManagedService } catch { Write-Warning $_.Exception.Message }
+  Write-Host "Rollback: restoring files"
   Restore-Path $Share "api"
   Restore-Path $CodexHome "codex"
   Restore-Path $TokenFile "github_token"
   Restore-Path $Ctl "controller"
+  Write-Host "Rollback: restoring scheduled task"
   if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
   }
@@ -245,10 +248,13 @@ function Restore-Installation {
     Register-ScheduledTask -TaskName $TaskName -Xml (Get-Content -LiteralPath $taskXml -Raw) -Force | Out-Null
   }
   if ($PreviousRunning) {
+    Write-Host "Rollback: starting previous controller"
     if (Test-Path $Ctl) { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Ctl start | Out-Null }
     else { Write-Warning "Previous controller was not restored; service cannot be restarted" }
+    Write-Host "Rollback: waiting for previous API"
     if (-not (Wait-ApiReady $Port)) { Write-Warning "Previous service was restored but did not become ready on port $Port" }
   }
+  Write-Host "Rollback: complete"
 }
 
 Write-Step "Preflight"
