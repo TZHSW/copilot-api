@@ -7,6 +7,26 @@ on:
     types: [opened, synchronize, reopened]
 
 jobs:
+  powershell-parse:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse native Windows scripts
+        shell: powershell
+        run: |
+          $failed = $false
+          Get-ChildItem deploy/codex/*.ps1 | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | Format-List
+              $failed = $true
+            }
+          }
+          if ($failed) { throw "PowerShell parser errors" }
+
   test:
     runs-on: ubuntu-latest
     steps:
