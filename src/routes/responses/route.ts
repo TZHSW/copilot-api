@@ -13,3 +13,11 @@ responseRoutes.post("/", async (c) => {
     return await forwardError(c, error)
   }
 })
+
+responseRoutes.all("/*", async (c) => {
+  try {
+    return await handleResponses(c)
+  } catch (error) {
+    return await forwardError(c, error)
+  }
+})

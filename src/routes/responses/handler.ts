@@ -1,55 +1,163 @@
 import type { Context } from "hono"
 
 import consola from "consola"
-import { streamSSE, type SSEMessage } from "hono/streaming"
+import { decompress as decompressZstd } from "fzstd"
 
 import { awaitApproval } from "~/lib/approval"
 import { checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
 import {
-  createResponses,
+  proxyResponses,
   type ResponsesPayload,
 } from "~/services/copilot/create-responses"
+
+const RESPONSES_PATH = /^\/(?:v1\/)?responses/
+const UNSUPPORTED_OPTIONAL_TOOLS = new Set(["image_generation"])
+const FAST_SERVICE_TIERS = new Set(["fast", "priority"])
+const FAST_MODEL_ALIASES = new Map([
+  ["gpt-5.6-sol", "gpt-5.6-sol-fast"],
+  ["gpt-5.6-sol-fast", "gpt-5.6-sol-fast"],
+])
+const textDecoder = new TextDecoder()
+
+export async function decodeResponsesRequestBody(
+  request: Request,
+): Promise<string> {
+  const body = new Uint8Array(await request.arrayBuffer())
+  const encodings = (request.headers.get("content-encoding") ?? "")
+    .split(",")
+    .map((encoding) => encoding.trim().toLowerCase())
+    .filter((encoding) => encoding && encoding !== "identity")
+
+  if (encodings.length === 0) return textDecoder.decode(body)
+  if (encodings.length === 1 && encodings[0] === "zstd") {
+    return textDecoder.decode(decompressZstd(body))
+  }
+
+  throw new Error(`Unsupported Content-Encoding: ${encodings.join(", ")}`)
+}
+
+export function prepareResponsesPayload(payload: ResponsesPayload): {
+  payload: ResponsesPayload
+  removedToolTypes: Array<string>
+} {
+  let preparedPayload = payload
+  const fastModel = FAST_MODEL_ALIASES.get(payload.model)
+  if (
+    typeof payload.service_tier === "string"
+    && FAST_SERVICE_TIERS.has(payload.service_tier)
+    && fastModel
+  ) {
+    const { service_tier: _serviceTier, ...rest } = payload
+    preparedPayload = {
+      ...rest,
+      model: fastModel,
+    }
+  }
+
+  if (!Array.isArray(preparedPayload.tools)) {
+    return { payload: preparedPayload, removedToolTypes: [] }
+  }
+
+  const toolChoice = preparedPayload.tool_choice
+  const explicitlySelectedType =
+    (
+      typeof toolChoice === "object"
+      && toolChoice !== null
+      && typeof (toolChoice as { type?: unknown }).type === "string"
+    ) ?
+      (toolChoice as { type: string }).type
+    : undefined
+  const removedToolTypes: Array<string> = []
+  const tools = (preparedPayload.tools as Array<unknown>).filter((tool) => {
+    if (typeof tool !== "object" || tool === null) return true
+    const type = (tool as { type?: unknown }).type
+    if (typeof type !== "string") return true
+    if (
+      !UNSUPPORTED_OPTIONAL_TOOLS.has(type)
+      || explicitlySelectedType === type
+    ) {
+      return true
+    }
+    removedToolTypes.push(type)
+    return false
+  })
+
+  return {
+    payload: { ...preparedPayload, tools },
+    removedToolTypes,
+  }
+}
 
 export async function handleResponses(c: Context) {
   await checkRateLimit(state)
 
-  const payload = await c.req.json<ResponsesPayload>()
+  const requestUrl = new URL(c.req.url)
+  const suffix = requestUrl.pathname.replace(RESPONSES_PATH, "")
+  const path = `/responses${suffix}`
+  const hasBody = !["DELETE", "GET", "HEAD"].includes(c.req.method)
+  let payload: ResponsesPayload | undefined
 
-  // Strip tools the Copilot Responses backend does not support
-  // (e.g. Codex CLI injects `image_generation` by default).
-  // Allowlist what we know Copilot accepts: function, mcp, web_search.
-  if (Array.isArray(payload.tools)) {
-    const allowed = new Set(["function", "mcp", "web_search"])
-    const before = payload.tools.length
-    payload.tools = (payload.tools as Array<{ type?: string }>).filter((t) =>
-      allowed.has(t.type ?? ""),
-    )
-    if (payload.tools.length !== before) {
-      consola.debug(
-        `Filtered ${before - payload.tools.length} unsupported tool(s)`,
+  if (hasBody) {
+    let rawBody: string
+    try {
+      rawBody = await decodeResponsesRequestBody(c.req.raw)
+    } catch {
+      return c.json(
+        {
+          error: {
+            message: "Request body must be valid JSON.",
+            type: "invalid_request_error",
+          },
+        },
+        400,
       )
+    }
+    if (rawBody.trim()) {
+      try {
+        payload = JSON.parse(rawBody) as ResponsesPayload
+      } catch {
+        return c.json(
+          {
+            error: {
+              message: "Request body must be valid JSON.",
+              type: "invalid_request_error",
+            },
+          },
+          400,
+        )
+      }
+
+      const prepared = prepareResponsesPayload(payload)
+      payload = prepared.payload
+      if (prepared.removedToolTypes.length > 0) {
+        consola.debug(
+          `Filtered optional Copilot-incompatible tools: ${prepared.removedToolTypes.join(", ")}`,
+        )
+      }
     }
   }
 
-  consola.debug("Responses payload:", JSON.stringify(payload).slice(-400))
-
   if (state.manualApprove) await awaitApproval()
 
-  const response = await createResponses(payload)
+  // Some Node server adapters expose an already-aborted request signal after
+  // the request body has been consumed. Passing that signal to fetch aborts
+  // every upstream request immediately; retain cancellation where the adapter
+  // provides a live signal and otherwise allow the request to proceed.
+  const signal = c.req.raw.signal.aborted ? undefined : c.req.raw.signal
+  const response = await proxyResponses(payload, {
+    method: c.req.method,
+    path,
+    search: requestUrl.search,
+    signal,
+  })
+  const headers = new Headers(response.headers)
+  headers.delete("content-encoding")
+  headers.delete("content-length")
 
-  if (isAsyncIterable(response)) {
-    consola.debug("Streaming response")
-    return streamSSE(c, async (stream) => {
-      for await (const chunk of response) {
-        await stream.writeSSE(chunk as SSEMessage)
-      }
-    })
-  }
-
-  consola.debug("Non-streaming response")
-  return c.json(response)
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  })
 }
-
-const isAsyncIterable = (value: unknown): value is AsyncIterable<unknown> =>
-  typeof value === "object" && value !== null && Symbol.asyncIterator in value

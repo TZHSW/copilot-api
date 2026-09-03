@@ -327,6 +327,35 @@ You can find more options here: [Claude Code settings](https://docs.anthropic.co
 
 You can also read more about IDE integration here: [Add Claude Code to your IDE](https://docs.anthropic.com/en/docs/claude-code/ide-integrations)
 
+## Using with OpenAI Codex
+
+Configure Codex to use the native Responses API in `~/.codex/config.toml`:
+
+```toml
+model = "gpt-5.6-sol"
+model_provider = "copilot"
+
+[model_providers.copilot]
+# Codex currently uses this exact display name to enable remote compaction.
+name = "OpenAI"
+base_url = "http://localhost:4141/v1"
+wire_api = "responses"
+env_key = "COPILOT_API_KEY"
+env_key_fallback = "dummy"
+requires_openai_auth = false
+```
+
+With `name = "OpenAI"`, automatic compaction and `/compact` use Copilot's
+encrypted remote compaction item over the normal `/v1/responses` endpoint.
+Codex's default zstd request compression is supported by the proxy.
+
+Register Copilot's read-only MCP endpoint to expose web search and GitHub tools
+to Codex:
+
+```sh
+codex mcp add copilot-api --url http://localhost:4141/mcp
+```
+
 ## Running from Source
 
 The project can be run from source in several ways:

@@ -1,6 +1,6 @@
 import { state } from "~/lib/state"
-
 import {
+  type ChatCompletionResponse,
   type ChatCompletionsPayload,
   type ContentPart,
   type Message,
@@ -83,8 +83,8 @@ function translateReasoningFields(
   if (!modelSupportsReasoning(translatedModel)) return {}
 
   const effort =
-    translateOutputConfigEffort(payload.output_config?.effort) ??
-    translateThinkingToReasoningEffort(payload.thinking)
+    translateOutputConfigEffort(payload.output_config?.effort)
+    ?? translateThinkingToReasoningEffort(payload.thinking)
 
   const thinking = translateThinking(payload.thinking)
 
@@ -100,11 +100,7 @@ function translateReasoningFields(
  * Maps "max" → "xhigh" (Copilot doesn't expose "max").
  */
 function translateOutputConfigEffort(
-  effort: AnthropicMessagesPayload["output_config"] extends infer T
-    ? T extends { effort?: infer E }
-      ? E
-      : never
-    : never,
+  effort: NonNullable<AnthropicMessagesPayload["output_config"]>["effort"],
 ): "low" | "medium" | "high" | "xhigh" | undefined {
   if (!effort) return undefined
   // Copilot doesn't currently expose "max"; map to xhigh (highest available).
@@ -203,7 +199,7 @@ function modelSupportsReasoning(translatedModel: string): boolean {
 // Returns the 1M catalog id, or the original model if no 1M variant exists.
 function resolve1mVariant(base: string): string {
   const candidates = [`${base}-1m-internal`, `${base}-1m`]
-  return candidates.find(catalogHasModel) ?? base
+  return candidates.find((candidate) => catalogHasModel(candidate)) ?? base
 }
 
 function translateModelName(model: string): string {
@@ -220,8 +216,8 @@ function translateModelName(model: string): string {
   // claude-opus-4-7-1m-internal → claude-opus-4.7-1m-internal
   // Already-dotted forms pass through unchanged.
   const normalized = base.replace(
-    /^(claude-(?:opus|sonnet|haiku)-(\d+))-(\d+)/,
-    "$1.$3",
+    /^(claude-(?:opus|sonnet|haiku)-\d+)-(\d+)/,
+    "$1.$2",
   )
 
   // Restore [1m] → best available 1M variant in catalog
@@ -234,7 +230,10 @@ function translateModelName(model: string): string {
   // separate 1M variant. Route bare names to the 1M variant so behavior
   // matches the official API. Falls back to base if no 1M variant exists.
   // Any major version, not just 4.x — opus 5 shipped after this was written.
-  if (!normalized.includes("-1m") && /^claude-opus-\d+\.\d+$/.test(normalized)) {
+  if (
+    !normalized.includes("-1m")
+    && /^claude-opus-\d+\.\d+$/.test(normalized)
+  ) {
     return resolve1mVariant(normalized)
   }
 
@@ -463,6 +462,22 @@ function translateAnthropicToolChoiceToOpenAI(
 
 // Response translation
 
+function getAnthropicThinkingBlocks(
+  message: ChatCompletionResponse["choices"][number]["message"],
+): Array<AnthropicThinkingBlock> {
+  if (!message.reasoning_text) return []
+
+  return [
+    {
+      type: "thinking",
+      thinking: message.reasoning_text,
+      ...(message.reasoning_opaque && {
+        signature: message.reasoning_opaque,
+      }),
+    },
+  ]
+}
+
 export function translateToAnthropic(
   response: ChatCompletionResponse,
 ): AnthropicResponse {
@@ -483,15 +498,7 @@ export function translateToAnthropic(
     // The matching `reasoning_opaque` field becomes the thinking
     // signature, which Anthropic clients can echo back on follow-up
     // turns to keep the CoT cached server-side.
-    if (choice.message.reasoning_text) {
-      allThinkingBlocks.push({
-        type: "thinking",
-        thinking: choice.message.reasoning_text,
-        ...(choice.message.reasoning_opaque && {
-          signature: choice.message.reasoning_opaque,
-        }),
-      })
-    }
+    allThinkingBlocks.push(...getAnthropicThinkingBlocks(choice.message))
 
     const textBlocks = getAnthropicTextBlocks(choice.message.content)
     const toolUseBlocks = getAnthropicToolUseBlocks(choice.message.tool_calls)
