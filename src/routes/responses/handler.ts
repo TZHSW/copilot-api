@@ -1,6 +1,7 @@
 import type { Context } from "hono"
 
 import consola from "consola"
+import { decompress as decompressZstd } from "fzstd"
 
 import { awaitApproval } from "~/lib/approval"
 import { checkRateLimit } from "~/lib/rate-limit"
@@ -12,6 +13,24 @@ import {
 
 const RESPONSES_PATH = /^\/(?:v1\/)?responses/
 const UNSUPPORTED_OPTIONAL_TOOLS = new Set(["image_generation"])
+const textDecoder = new TextDecoder()
+
+export async function decodeResponsesRequestBody(
+  request: Request,
+): Promise<string> {
+  const body = new Uint8Array(await request.arrayBuffer())
+  const encodings = (request.headers.get("content-encoding") ?? "")
+    .split(",")
+    .map((encoding) => encoding.trim().toLowerCase())
+    .filter((encoding) => encoding && encoding !== "identity")
+
+  if (encodings.length === 0) return textDecoder.decode(body)
+  if (encodings.length === 1 && encodings[0] === "zstd") {
+    return textDecoder.decode(decompressZstd(body))
+  }
+
+  throw new Error(`Unsupported Content-Encoding: ${encodings.join(", ")}`)
+}
 
 export function prepareResponsesPayload(payload: ResponsesPayload): {
   payload: ResponsesPayload
@@ -61,7 +80,20 @@ export async function handleResponses(c: Context) {
   let payload: ResponsesPayload | undefined
 
   if (hasBody) {
-    const rawBody = await c.req.text()
+    let rawBody: string
+    try {
+      rawBody = await decodeResponsesRequestBody(c.req.raw)
+    } catch {
+      return c.json(
+        {
+          error: {
+            message: "Request body must be valid JSON.",
+            type: "invalid_request_error",
+          },
+        },
+        400,
+      )
+    }
     if (rawBody.trim()) {
       try {
         payload = JSON.parse(rawBody) as ResponsesPayload
@@ -89,11 +121,16 @@ export async function handleResponses(c: Context) {
 
   if (state.manualApprove) await awaitApproval()
 
+  // Some Node server adapters expose an already-aborted request signal after
+  // the request body has been consumed. Passing that signal to fetch aborts
+  // every upstream request immediately; retain cancellation where the adapter
+  // provides a live signal and otherwise allow the request to proceed.
+  const signal = c.req.raw.signal.aborted ? undefined : c.req.raw.signal
   const response = await proxyResponses(payload, {
     method: c.req.method,
     path,
     search: requestUrl.search,
-    signal: c.req.raw.signal,
+    signal,
   })
   const headers = new Headers(response.headers)
   headers.delete("content-encoding")

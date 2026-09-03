@@ -168,6 +168,49 @@ test("preserves SSE bytes and upstream response headers", async () => {
   expect(response.headers.get("x-request-id")).toBe("request-1")
 })
 
+test("accepts Codex zstd-compressed Responses request bodies", async () => {
+  const payload = {
+    model: "gpt-5.6-sol",
+    input: [
+      { role: "user", content: "remember 1234" },
+      { type: "compaction_trigger" },
+    ],
+    stream: true,
+  }
+  const body = Bun.zstdCompressSync(
+    new TextEncoder().encode(JSON.stringify(payload)),
+  )
+
+  const response = await server.request("http://localhost/v1/responses", {
+    method: "POST",
+    headers: {
+      "content-encoding": "zstd",
+      "content-type": "application/json",
+    },
+    body,
+  })
+
+  expect(response.status).toBe(200)
+  const init = fetchMock.mock.calls[0]?.[1] as RequestInit
+  expect(JSON.parse(init.body as string)).toEqual(payload)
+})
+
+test("does not abort upstream fetches for adapter-aborted request signals", async () => {
+  const controller = new AbortController()
+  controller.abort()
+
+  const response = await server.request("http://localhost/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "gpt-5.6-sol", input: "hello" }),
+    signal: controller.signal,
+  })
+
+  expect(response.status).toBe(200)
+  const init = fetchMock.mock.calls[0]?.[1] as RequestInit
+  expect(init.signal).toBeUndefined()
+})
+
 test("forwards response subpaths, query parameters, and empty POST bodies", async () => {
   const response = await server.request(
     "http://localhost/v1/responses/resp_1/cancel?beta=true",
