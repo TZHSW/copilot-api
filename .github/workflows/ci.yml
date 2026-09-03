@@ -69,6 +69,7 @@ jobs:
           .\deploy\codex\install.ps1 -PackageRoot $package -InstallRoot $target -CodexHome "$target\.codex" -Port 54141 -Offline -NoScheduledTask -DryRun
 
       - name: Exercise Windows controller in a spaced path
+        timeout-minutes: 2
         shell: powershell
         run: |
           $package = Join-Path $env:RUNNER_TEMP "portable package"

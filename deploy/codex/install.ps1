@@ -190,9 +190,12 @@ if ($Action -eq "start") {
   if ($existing) { Write-Host "Running (pid $($existing.Id))"; exit 0 }
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $PidFile) | Out-Null
   $argumentLine = '"' + $Main.Replace('"', '\"') + '" start --account-type enterprise --port ' + $Port
+  Write-Host "Launching API process"
   $process = Start-Process -FilePath $NodePath -ArgumentList $argumentLine -WindowStyle Hidden -RedirectStandardOutput $LogFile -RedirectStandardError $ErrorLog -PassThru
+  Write-Host "Launched API candidate (pid $($process.Id))"
   @{ Pid = $process.Id; StartTimeUtcTicks = $process.StartTime.ToUniversalTime().Ticks } | ConvertTo-Json -Compress | Set-Content -LiteralPath $PidFile -Encoding ASCII
   Start-Sleep -Milliseconds 500
+  Write-Host "Checking API process identity"
   if (-not (Get-ManagedProcess)) { throw "API process exited; inspect $ErrorLog" }
   Write-Host "Started (pid $($process.Id))"
   exit 0
@@ -320,7 +323,7 @@ try {
     & schtasks.exe /Create /TN $TaskName /SC ONLOGON /TR $taskCommand /RL LIMITED /F | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Failed to register scheduled task $TaskName" }
   }
-  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Ctl restart | Out-Null
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Ctl restart
   if ($LASTEXITCODE -ne 0) { throw "Failed to start Copilot API" }
 
   Write-Step "Verify installation"
