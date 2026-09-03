@@ -143,11 +143,22 @@ export function transformToml(text, { port, home }) {
   )
   if (!provider) throw new Error("missing [model_providers.copilot]")
 
+  provider.lines = provider.lines.filter(
+    (line) =>
+      !/^\s*(?:env_key|env_key_fallback|env_key_instructions|experimental_bearer_token)\s*=/.test(
+        line,
+      ),
+  )
   const providerUrlIndex = provider.lines.findIndex((line) =>
     /^\s*base_url\s*=/.test(line),
   )
   if (providerUrlIndex === -1) throw new Error("missing Copilot base_url")
   provider.lines[providerUrlIndex] = `base_url = "http://localhost:${port}/v1"`
+  provider.lines.splice(
+    providerUrlIndex + 1,
+    0,
+    'experimental_bearer_token = "dummy"',
+  )
 
   const mcp = sections.find(
     ({ keys }) =>

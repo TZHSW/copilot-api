@@ -59,6 +59,7 @@ cd .\copilot-codex-*
 - 替换 `config.toml`、`auth.json` 和平台适用的 hooks；
 - 合并 skills/plugins，同名文件以包内快照为准；
 - 重写本地 API/MCP 端口；
+- 为不校验密钥的本地 API 写入固定 bearer 占位值，不依赖 `COPILOT_API_KEY` 环境变量；
 - 删除属于源机器的项目信任路径；
 - 不扫描、备份或迁移 `.tmp`、`packages`、sessions、history、日志和 SQLite 状态。
 
