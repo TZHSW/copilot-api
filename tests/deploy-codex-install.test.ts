@@ -1,5 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { chmod, mkdir, mkdtemp, readFile, symlink } from "node:fs/promises"
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  stat,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fetch as undiciFetch } from "undici"
@@ -10,6 +19,7 @@ import {
   runCommand,
   treeHashes,
   writeFixture,
+  writeManifest,
 } from "./helpers/deploy-codex"
 
 const installer = join(process.cwd(), "deploy/codex/install.sh")
@@ -112,6 +122,9 @@ describe("portable Linux installer", () => {
     expect(await readFile(join(codexHome, "config.toml"), "utf8")).toContain(
       `base_url = "http://localhost:${port}/v1"`,
     )
+    expect((await stat(join(codexHome, "config.toml"))).mode & 0o777).toBe(
+      0o600,
+    )
     expect(
       await readFile(
         join(fixture.installRoot, ".local/share/copilot-api/github_token"),
@@ -139,8 +152,27 @@ describe("portable Linux installer", () => {
     expect(diagnosis.stdout).not.toContain("fixture-token")
     expect(await treeHashes(codexHome)).toEqual(configBeforeDiagnosis)
     expect((await runCommand("bash", [controller, "stop"])).exitCode).toBe(0)
-  }, 20_000)
 
+    const unrelated = Bun.spawn(["sleep", "30"])
+    try {
+      await writeFile(
+        join(fixture.installRoot, ".local/share/copilot-api-patched/run.pid"),
+        `${unrelated.pid}\n`,
+      )
+      expect((await runCommand("bash", [controller, "stop"])).exitCode).toBe(0)
+      const wasKilled = await Promise.race([
+        unrelated.exited.then(() => true),
+        Bun.sleep(200).then(() => false),
+      ])
+      expect(wasKilled).toBe(false)
+    } finally {
+      unrelated.kill()
+      await unrelated.exited
+    }
+  }, 20_000)
+})
+
+describe("portable Linux installer validation and recovery", () => {
   test("restores config and credentials after a post-migration failure", async () => {
     const fixture = await createCompleteInstallerFixture()
     const port = await unusedPort()
@@ -183,4 +215,73 @@ describe("portable Linux installer", () => {
     ).toBe(false)
     expect(await pathExists(systemctlMarker)).toBe(false)
   }, 20_000)
+
+  test("rejects payload files omitted from the manifest", async () => {
+    const fixture = await createCompleteInstallerFixture()
+    await writeFixture(join(fixture.packageRoot, "unhashed-extra"), "extra")
+
+    const result = await runInstaller({
+      INSTALL_FAIL_AFTER_CONFIG: "1",
+      INSTALL_ROOT: fixture.installRoot,
+      OFFLINE: "1",
+      PACKAGE_ROOT: fixture.packageRoot,
+      PATH: fixture.path,
+      PORT: String(await unusedPort()),
+      SUPERVISOR: "nohup",
+    })
+
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain("未列入 manifest")
+  }, 20_000)
+
+  test("requires hooks.json before mutating the target", async () => {
+    const fixture = await createCompleteInstallerFixture()
+    await unlink(join(fixture.packageRoot, "codex-config/hooks.json"))
+    await writeManifest(fixture.packageRoot)
+
+    const result = await runInstaller({
+      INSTALL_FAIL_AFTER_CONFIG: "1",
+      INSTALL_ROOT: fixture.installRoot,
+      OFFLINE: "1",
+      PACKAGE_ROOT: fixture.packageRoot,
+      PATH: fixture.path,
+      PORT: String(await unusedPort()),
+      SUPERVISOR: "nohup",
+    })
+
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain("codex-config/hooks.json")
+    expect(await pathExists(fixture.installRoot)).toBe(false)
+  }, 20_000)
+
+  test("restores a running previous service when upgrade fails after stop", async () => {
+    const fixture = await createCompleteInstallerFixture()
+    const port = await unusedPort()
+    const controller = join(fixture.installRoot, ".local/bin/copilot-api-ctl")
+    controllers.push(controller)
+    const environment = {
+      CODEX_HOME: join(fixture.installRoot, ".codex"),
+      INSTALL_ROOT: fixture.installRoot,
+      OFFLINE: "1",
+      PACKAGE_ROOT: fixture.packageRoot,
+      PATH: fixture.path,
+      PORT: String(port),
+      SUPERVISOR: "nohup",
+    }
+    expect((await runInstaller(environment)).exitCode).toBe(0)
+
+    const failedUpgrade = await runInstaller({
+      ...environment,
+      INSTALL_FAIL_AFTER_STOP: "1",
+    })
+
+    expect(failedUpgrade.exitCode).not.toBe(0)
+    expect(failedUpgrade.stderr).toContain("恢复")
+    expect(
+      await undiciFetch(`http://127.0.0.1:${port}/`).then((response) =>
+        response.text(),
+      ),
+    ).toBe("Server running")
+    expect((await runCommand("bash", [controller, "status"])).exitCode).toBe(0)
+  }, 30_000)
 })

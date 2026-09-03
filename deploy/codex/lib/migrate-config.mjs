@@ -401,11 +401,12 @@ export async function migrateConfig(options) {
 
   if (transformedConfig) {
     const targetConfig = join(options.target, "config.toml")
-    if (!(await fileMatchesContent(targetConfig, transformedConfig))) {
+    if (!(await fileMatchesContent(targetConfig, transformedConfig, 0o600))) {
       changed.push("config.toml")
       if (!options.dryRun) {
         await mkdir(options.target, { recursive: true })
         await writeFile(targetConfig, transformedConfig)
+        await chmod(targetConfig, 0o600)
       }
     }
   }
@@ -419,13 +420,12 @@ export async function migrateConfig(options) {
   for (const [relativePath, contents] of managedFiles) {
     if (!contents) continue
     const targetFile = join(options.target, relativePath)
-    const expectedMode = relativePath === "auth.json" ? 0o600 : undefined
-    if (!(await fileMatchesContent(targetFile, contents, expectedMode))) {
+    if (!(await fileMatchesContent(targetFile, contents, 0o600))) {
       changed.push(relativePath)
       if (!options.dryRun) {
         await mkdir(options.target, { recursive: true })
         await writeFile(targetFile, contents)
-        if (expectedMode !== undefined) await chmod(targetFile, expectedMode)
+        await chmod(targetFile, 0o600)
       }
     }
   }

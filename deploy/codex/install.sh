@@ -23,6 +23,9 @@ BACKUP=$BACKUP_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-$$
 NODE_BIN=""
 CODEX_BIN=${CODEX_BIN:-}
 PREVIOUS_RUNNING=0
+PREVIOUS_UNIT_ACTIVE=0
+PREVIOUS_UNIT_ENABLED=0
+PREVIOUS_UNIT_EXISTS=0
 MUTATED=0
 
 say() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
@@ -41,8 +44,35 @@ validate_target() {
 
 verify_manifest() {
   [ -f "$PACKAGE_ROOT/MANIFEST.sha256" ] || die "缺少 MANIFEST.sha256"
-  (cd "$PACKAGE_ROOT" && sha256sum -c MANIFEST.sha256 --quiet) \
-    || die "安装包校验失败，文件可能损坏或被修改"
+  declare -A listed=()
+  local line expected relative_path file actual
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ ^([0-9a-fA-F]{64})'  '(.+)$ ]] \
+      || die "MANIFEST.sha256 格式错误"
+    expected=${BASH_REMATCH[1],,}
+    relative_path=${BASH_REMATCH[2]}
+    relative_path=${relative_path#./}
+    case "/$relative_path/" in
+      //* | */../* | */./*) die "manifest 包含不安全路径：$relative_path" ;;
+    esac
+    [ -n "$relative_path" ] && [ "$relative_path" != MANIFEST.sha256 ] \
+      || die "manifest 包含无效路径"
+    [ -z "${listed[$relative_path]+x}" ] || die "manifest 路径重复：$relative_path"
+    listed[$relative_path]=1
+    file=$PACKAGE_ROOT/$relative_path
+    [ -f "$file" ] && [ ! -L "$file" ] || die "manifest 文件缺失或类型错误：$relative_path"
+    actual=$(sha256sum "$file" | cut -d' ' -f1)
+    [ "$actual" = "$expected" ] || die "安装包校验失败：$relative_path"
+  done <"$PACKAGE_ROOT/MANIFEST.sha256"
+  [ "${#listed[@]}" -gt 0 ] || die "manifest 为空"
+  if find "$PACKAGE_ROOT" -type l -print -quit | grep -q .; then
+    die "安装包不能包含符号链接"
+  fi
+  while IFS= read -r -d '' file; do
+    relative_path=${file#"$PACKAGE_ROOT/"}
+    [ "$relative_path" = MANIFEST.sha256 ] && continue
+    [ -n "${listed[$relative_path]+x}" ] || die "文件未列入 manifest：$relative_path"
+  done < <(find "$PACKAGE_ROOT" -type f -print0)
 }
 
 port_pid() {
@@ -135,13 +165,24 @@ rollback() {
   restore_path "$USER_HOME/.orca/agent-hooks" orca-agent-hooks
   restore_path "$CTL" controller
   restore_path "$UNIT_FILE" systemd-unit
-  if [ "$PREVIOUS_RUNNING" -eq 1 ]; then
-    if [ -x "$CTL" ]; then
-      "$CTL" start >/dev/null 2>&1 || true
-    elif host_systemd_allowed && have_user_systemd; then
-      systemctl --user daemon-reload >/dev/null 2>&1 || true
-      systemctl --user start copilot-api.service >/dev/null 2>&1 || true
+  if host_systemd_allowed && have_user_systemd; then
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    if [ "$PREVIOUS_UNIT_EXISTS" -eq 1 ]; then
+      if [ "$PREVIOUS_UNIT_ENABLED" -eq 1 ]; then
+        systemctl --user enable copilot-api.service >/dev/null 2>&1 || true
+      else
+        systemctl --user disable copilot-api.service >/dev/null 2>&1 || true
+      fi
+      if [ "$PREVIOUS_UNIT_ACTIVE" -eq 1 ]; then
+        systemctl --user start copilot-api.service >/dev/null 2>&1 || true
+      else
+        systemctl --user stop copilot-api.service >/dev/null 2>&1 || true
+      fi
+    else
+      systemctl --user disable --now copilot-api.service >/dev/null 2>&1 || true
     fi
+  elif [ "$PREVIOUS_RUNNING" -eq 1 ] && [ -x "$CTL" ]; then
+    "$CTL" start >/dev/null 2>&1 || true
   fi
   exit "$status"
 }
@@ -157,25 +198,49 @@ PORT=$(printf '%q' "$PORT")
 PID_FILE=$(printf '%q' "$SHARE/run.pid")
 LOG_FILE=$(printf '%q' "$SHARE/run.log")
 
+read_pid_record() {
+  [ -s "\$PID_FILE" ] || return 1
+  read -r SAVED_PID SAVED_START <"\$PID_FILE"
+  [[ "\$SAVED_PID" =~ ^[0-9]+$ ]] && [[ "\$SAVED_START" =~ ^[0-9]+$ ]]
+}
+
+process_matches() {
+  read_pid_record || return 1
+  kill -0 "\$SAVED_PID" 2>/dev/null || return 1
+  [ "\$(readlink -f "/proc/\$SAVED_PID/exe" 2>/dev/null)" = "\$(readlink -f "\$NODE")" ] || return 1
+  proc_stat=\$(cat "/proc/\$SAVED_PID/stat" 2>/dev/null) || return 1
+  proc_stat=\${proc_stat#*) }
+  read -r -a stat_fields <<<"\$proc_stat"
+  [ "\${stat_fields[19]:-}" = "\$SAVED_START" ] || return 1
+  mapfile -d '' argv <"/proc/\$SAVED_PID/cmdline" || return 1
+  [ "\${argv[1]:-}" = "\$MAIN" ] \
+    && [ "\${argv[2]:-}" = start ] \
+    && [ "\${argv[3]:-}" = --account-type ] \
+    && [ "\${argv[4]:-}" = enterprise ] \
+    && [ "\${argv[5]:-}" = --port ] \
+    && [ "\${argv[6]:-}" = "\$PORT" ]
+}
+
 running() {
-  [ -s "\$PID_FILE" ] && kill -0 "\$(cat "\$PID_FILE")" 2>/dev/null
+  process_matches
 }
 
 case "\${1:-status}" in
   start)
-    if running; then echo "运行中 (pid \$(cat "\$PID_FILE"))"; exit 0; fi
+    if running; then echo "运行中 (pid \$SAVED_PID)"; exit 0; fi
+    rm -f "\$PID_FILE"
     mkdir -p "\$(dirname "\$PID_FILE")"
     launcher=nohup
     command -v setsid >/dev/null 2>&1 && launcher=setsid
-    "\$launcher" bash -c 'echo \$\$ > "\$1"; shift; exec "\$@"' _ "\$PID_FILE" \
+    "\$launcher" bash -c 'pidfile=\$1; shift; proc_stat=\$(cat /proc/\$\$/stat); proc_stat=\${proc_stat#*) }; read -r -a fields <<<"\$proc_stat"; printf "%s %s\\n" "\$\$" "\${fields[19]}" >"\$pidfile"; exec "\$@"' _ "\$PID_FILE" \
       "\$NODE" "\$MAIN" start --account-type enterprise --port "\$PORT" >>"\$LOG_FILE" 2>&1 </dev/null &
     for _ in \$(seq 1 40); do [ -s "\$PID_FILE" ] && break; sleep 0.05; done
     running || { tail -30 "\$LOG_FILE" >&2 || true; rm -f "\$PID_FILE"; exit 1; }
-    echo "已启动 (pid \$(cat "\$PID_FILE"))"
+    echo "已启动 (pid \$SAVED_PID)"
     ;;
   stop)
     if running; then
-      pid=\$(cat "\$PID_FILE")
+      pid=\$SAVED_PID
       kill "\$pid" 2>/dev/null || true
       for _ in \$(seq 1 40); do kill -0 "\$pid" 2>/dev/null || break; sleep 0.1; done
     fi
@@ -183,7 +248,7 @@ case "\${1:-status}" in
     echo "已停止"
     ;;
   restart) "\$0" stop >/dev/null; "\$0" start ;;
-  status) running && echo "运行中 (pid \$(cat "\$PID_FILE"))" || { echo "未运行"; exit 3; } ;;
+  status) running && echo "运行中 (pid \$SAVED_PID)" || { rm -f "\$PID_FILE"; echo "未运行"; exit 3; } ;;
   log) tail -f "\$LOG_FILE" ;;
   *) echo "用法: \$(basename "\$0") {start|stop|restart|status|log}" >&2; exit 2 ;;
 esac
@@ -253,6 +318,7 @@ require_cmd sha256sum "需要 sha256sum"
 [ -f "$PACKAGE_ROOT/lib/verify-service.mjs" ] || die "缺少 lib/verify-service.mjs"
 [ -f "$PACKAGE_ROOT/codex-config/config.toml" ] || die "缺少 codex-config/config.toml"
 [ -f "$PACKAGE_ROOT/codex-config/auth.json" ] || die "缺少 codex-config/auth.json"
+[ -f "$PACKAGE_ROOT/codex-config/hooks.json" ] || die "缺少 codex-config/hooks.json"
 [ -f "$PACKAGE_ROOT/credentials/github_token" ] || die "缺少 credentials/github_token"
 verify_manifest
 
@@ -277,12 +343,24 @@ backup_if_present "$USER_HOME/.orca/agent-hooks" orca-agent-hooks
 backup_if_present "$CTL" controller
 backup_if_present "$UNIT_FILE" systemd-unit
 
-if [ "$PREVIOUS_RUNNING" -eq 1 ]; then
-  stop_managed_process || die "无法停止旧的托管服务"
+if host_systemd_allowed && have_user_systemd; then
+  [ -f "$UNIT_FILE" ] && PREVIOUS_UNIT_EXISTS=1
+  systemctl --user is-enabled copilot-api.service >/dev/null 2>&1 \
+    && PREVIOUS_UNIT_ENABLED=1
+  systemctl --user is-active copilot-api.service >/dev/null 2>&1 \
+    && PREVIOUS_UNIT_ACTIVE=1
 fi
 
 trap rollback ERR INT TERM
 MUTATED=1
+
+if [ "$PREVIOUS_RUNNING" -eq 1 ]; then
+  stop_managed_process
+fi
+if [ "${INSTALL_FAIL_AFTER_STOP:-0}" = 1 ]; then
+  warn "按测试要求在停止旧服务后注入失败"
+  false
+fi
 
 say "部署自包含 API"
 STAGE=$USER_HOME/.local/share/.copilot-api-patched.new.$$

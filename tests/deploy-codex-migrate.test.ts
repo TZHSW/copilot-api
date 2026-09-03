@@ -281,23 +281,35 @@ base_url = "http://localhost:4141/v1"
     ])
   })
 
-  test("writes authentication data with user-only permissions", async () => {
+  test("writes credential-capable config files with user-only permissions", async () => {
     const { backup, source, target } = await makeTempTree()
+    await writeFixture(
+      `${source}/config.toml`,
+      '[model_providers.copilot]\nbase_url = "http://localhost:4141/v1"\n',
+    )
     await writeFixture(`${source}/auth.json`, '{"token":"secret"}\n')
-    await writeFixture(`${target}/auth.json`, '{"token":"secret"}\n')
+    await writeFixture(`${source}/hooks.json`, '{"hooks":{}}\n')
+    await chmod(`${source}/config.toml`, 0o644)
     await chmod(`${source}/auth.json`, 0o644)
-    await chmod(`${target}/auth.json`, 0o644)
+    await chmod(`${source}/hooks.json`, 0o644)
 
-    await migration.migrateConfig({
-      backup,
-      home: target,
-      platform: "linux",
-      port: 4141,
-      source,
-      target,
-    })
+    const previousUmask = process.umask(0o022)
+    try {
+      await migration.migrateConfig({
+        backup,
+        home: target,
+        platform: "linux",
+        port: 4141,
+        source,
+        target,
+      })
+    } finally {
+      process.umask(previousUmask)
+    }
 
+    expect((await stat(`${target}/config.toml`)).mode & 0o777).toBe(0o600)
     expect((await stat(`${target}/auth.json`)).mode & 0o777).toBe(0o600)
+    expect((await stat(`${target}/hooks.json`)).mode & 0o777).toBe(0o600)
   })
 
   test("merges only portable skill and plugin files", async () => {

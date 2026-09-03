@@ -19,6 +19,8 @@ Write-Heading "Environment"
 Write-Host "PORT=$Port"
 Write-Host "CODEX_HOME=$CodexHome"
 Write-Host "API_ROOT=$Share"
+$provider = Select-String -Path (Join-Path $CodexHome "config.toml") -Pattern '^\s*base_url\s*=' -ErrorAction SilentlyContinue | Select-Object -First 1
+Write-Host "configured provider: $(if ($provider) { $provider.Line.Trim() } else { 'not configured' })"
 & node --version
 & codex --version
 

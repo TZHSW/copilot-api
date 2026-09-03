@@ -62,6 +62,13 @@ cd .\copilot-codex-*
 
 Linux 备份位于 `~/.local/share/copilot-codex-backups/`。Windows 备份位于 `%LOCALAPPDATA%\copilot-codex-backups\`。本地安装失败时自动恢复；成功安装的备份仍会保留。
 
+手动恢复时，先停止 API，选择对应时间戳目录，把其中的 `api`、`codex`、`github_token` 和 `controller` 复制回原位置，再重新启动旧控制脚本。Linux systemd 安装还需复制 `systemd-unit` 到 `~/.config/systemd/user/copilot-api.service`，运行 `systemctl --user daemon-reload && systemctl --user enable --now copilot-api.service`。Windows 若备份包含 `scheduled-task.xml`，可运行：
+
+```powershell
+schtasks.exe /Delete /TN CopilotApiPatched /F
+schtasks.exe /Create /TN CopilotApiPatched /XML .\scheduled-task.xml /F
+```
+
 Windows 无法原生执行 Unix Orca hooks，因此原文件保存为 `.codex\hooks.linux.json`，活动 `hooks.json` 为空。Linux 会迁移对应 Orca hook 脚本。
 
 ## 诊断

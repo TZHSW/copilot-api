@@ -17,6 +17,7 @@ heading "环境"
 printf 'node:  %s %s\n' "$(command -v node 2>/dev/null || echo 未找到)" "$(node --version 2>/dev/null || true)"
 printf 'codex: %s %s\n' "$(command -v codex 2>/dev/null || echo 未找到)" "$(codex --version 2>/dev/null | head -1 || true)"
 printf 'PORT=%s\nCODEX_HOME=%s\nAPI_ROOT=%s\n' "$PORT" "$CODEX_HOME" "$SHARE"
+printf 'configured provider: %s\n' "$(grep -m1 -E '^[[:space:]]*base_url[[:space:]]*=' "$CODEX_HOME/config.toml" 2>/dev/null || echo 未配置)"
 
 heading "服务状态"
 if [ -x "$CTL" ]; then

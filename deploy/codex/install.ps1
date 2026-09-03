@@ -5,12 +5,15 @@ param(
   [switch]$Offline,
   [string]$BackupDir,
   [switch]$NoScheduledTask,
-  [string]$InstallRoot
+  [string]$InstallRoot,
+  [switch]$DryRun,
+  [string]$PackageRoot
 )
 
 $ErrorActionPreference = "Stop"
 $TaskName = "CopilotApiPatched"
-$PackageRoot = $PSScriptRoot
+if (-not $PackageRoot) { $PackageRoot = $PSScriptRoot }
+$PackageRoot = [IO.Path]::GetFullPath($PackageRoot)
 $UserHome = if ($InstallRoot) { $InstallRoot } else { $HOME }
 $LocalRoot = if ($InstallRoot) { Join-Path $InstallRoot "AppData\Local" } else { $env:LOCALAPPDATA }
 if (-not $LocalRoot) { throw "LOCALAPPDATA is unavailable" }
@@ -102,17 +105,36 @@ function Restore-Path([string]$Destination, [string]$Name) {
 function Verify-Manifest {
   $manifest = Join-Path $PackageRoot "MANIFEST.sha256"
   if (-not (Test-Path $manifest)) { throw "Missing MANIFEST.sha256" }
+  $root = [IO.Path]::GetFullPath($PackageRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+  $rootPrefix = $root + [IO.Path]::DirectorySeparatorChar
+  $listed = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
   foreach ($line in Get-Content -LiteralPath $manifest) {
     if (-not $line) { continue }
     if ($line -notmatch '^([0-9a-fA-F]{64})  (.+)$') { throw "Malformed manifest line: $line" }
     $relative = $Matches[2].Replace('/', [IO.Path]::DirectorySeparatorChar)
+    if ($relative.StartsWith("." + [IO.Path]::DirectorySeparatorChar)) { $relative = $relative.Substring(2) }
+    $segments = $relative.Split([IO.Path]::DirectorySeparatorChar)
+    if (-not $relative -or [IO.Path]::IsPathRooted($relative) -or $segments -contains ".." -or $segments -contains ".") {
+      throw "Unsafe manifest path: $relative"
+    }
+    if (-not $listed.Add($relative)) { throw "Duplicate manifest path: $relative" }
     $file = [IO.Path]::GetFullPath((Join-Path $PackageRoot $relative))
-    if (-not $file.StartsWith([IO.Path]::GetFullPath($PackageRoot), [StringComparison]::OrdinalIgnoreCase)) {
+    if (-not $file.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
       throw "Manifest path escapes package: $relative"
     }
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing package file: $relative" }
+    $item = Get-Item -LiteralPath $file -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Package links are not allowed: $relative" }
     $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash
     if ($actual -ne $Matches[1]) { throw "Package checksum mismatch: $relative" }
+  }
+  if ($listed.Count -eq 0) { throw "Manifest is empty" }
+  $links = Get-ChildItem -LiteralPath $PackageRoot -Recurse -Force | Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 }
+  if ($links) { throw "Package links are not allowed: $($links[0].FullName)" }
+  foreach ($file in Get-ChildItem -LiteralPath $PackageRoot -Recurse -File -Force) {
+    if ($file.FullName -eq $manifest) { continue }
+    $relative = $file.FullName.Substring($rootPrefix.Length)
+    if (-not $listed.Contains($relative)) { throw "File is not listed in manifest: $relative" }
   }
 }
 
@@ -135,16 +157,24 @@ $ErrorLog = '__ERROR_LOG__'
 
 function Get-ManagedProcess {
   if (-not (Test-Path $PidFile)) { return $null }
-  $savedPid = [int](Get-Content $PidFile -Raw)
-  return Get-Process -Id $savedPid -ErrorAction SilentlyContinue
+  try { $record = Get-Content $PidFile -Raw | ConvertFrom-Json } catch { return $null }
+  $process = Get-Process -Id ([int]$record.Pid) -ErrorAction SilentlyContinue
+  if (-not $process) { return $null }
+  if ([int64]$record.StartTimeUtcTicks -ne $process.StartTime.ToUniversalTime().Ticks) { return $null }
+  if (-not $process.Path.Equals($NodePath, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+  $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $($process.Id)" -ErrorAction SilentlyContinue
+  $commandLine = if ($cim) { [string]$cim.CommandLine } else { "" }
+  if (-not $commandLine.Contains($Main) -or -not $commandLine.Contains(" start ") -or -not $commandLine.Contains("--account-type enterprise") -or -not $commandLine.Contains("--port $Port")) { return $null }
+  return $process
 }
 
 if ($Action -eq "start") {
   $existing = Get-ManagedProcess
   if ($existing) { Write-Host "Running (pid $($existing.Id))"; exit 0 }
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $PidFile) | Out-Null
-  $process = Start-Process -FilePath $NodePath -ArgumentList @($Main, "start", "--account-type", "enterprise", "--port", [string]$Port) -WindowStyle Hidden -RedirectStandardOutput $LogFile -RedirectStandardError $ErrorLog -PassThru
-  Set-Content -LiteralPath $PidFile -Value $process.Id -Encoding ASCII
+  $argumentLine = '"' + $Main.Replace('"', '\"') + '" start --account-type enterprise --port ' + $Port
+  $process = Start-Process -FilePath $NodePath -ArgumentList $argumentLine -WindowStyle Hidden -RedirectStandardOutput $LogFile -RedirectStandardError $ErrorLog -PassThru
+  @{ Pid = $process.Id; StartTimeUtcTicks = $process.StartTime.ToUniversalTime().Ticks } | ConvertTo-Json -Compress | Set-Content -LiteralPath $PidFile -Encoding ASCII
   Start-Sleep -Milliseconds 500
   if (-not (Get-ManagedProcess)) { throw "API process exited; inspect $ErrorLog" }
   Write-Host "Started (pid $($process.Id))"
@@ -205,7 +235,7 @@ $Codex = Assert-Command "codex" "Codex CLI is required; this installer does not 
 $nodeMajor = [int](& $Node -p 'Number(process.versions.node.split(".")[0])')
 if ($nodeMajor -lt 20) { throw "Node.js 20 or newer is required" }
 & $Codex --version | Out-Null
-foreach ($required in @("dist\main.js", "lib\migrate-config.mjs", "lib\verify-service.mjs", "codex-config\config.toml", "codex-config\auth.json", "credentials\github_token")) {
+foreach ($required in @("dist\main.js", "lib\migrate-config.mjs", "lib\verify-service.mjs", "codex-config\config.toml", "codex-config\auth.json", "codex-config\hooks.json", "credentials\github_token")) {
   if (-not (Test-Path (Join-Path $PackageRoot $required))) { throw "Missing package file: $required" }
 }
 Verify-Manifest
@@ -220,6 +250,14 @@ if ($owner) {
   throw "Port $Port answers but its owner cannot be verified; refusing to replace it"
 }
 
+if ($DryRun) {
+  $dryRunResult = & $Node (Join-Path $PackageRoot "lib\migrate-config.mjs") --source (Join-Path $PackageRoot "codex-config") --target $CodexHome --home $UserHome --port $Port --platform win32 --backup $Backup --dry-run
+  if ($LASTEXITCODE -ne 0) { throw "Configuration dry-run failed" }
+  Write-Host $dryRunResult
+  Write-Host "Dry run complete; no files, processes, or scheduled tasks were changed"
+  exit 0
+}
+
 Write-Step "Backup"
 New-Item -ItemType Directory -Force -Path $Backup | Out-Null
 Backup-Path $Share "api"
@@ -229,10 +267,9 @@ Backup-Path $Ctl "controller"
 if ((& schtasks.exe /Query /TN $TaskName 2>$null) -and $LASTEXITCODE -eq 0) {
   & schtasks.exe /Query /TN $TaskName /XML 2>$null | Set-Content -LiteralPath (Join-Path $Backup "scheduled-task.xml") -Encoding Unicode
 }
-if ($PreviousRunning) { Stop-ManagedService }
-
 try {
   $Mutated = $true
+  if ($PreviousRunning) { Stop-ManagedService }
   Write-Step "Deploy standalone API"
   $stage = "$Share.new.$PID"
   if (Test-Path $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
