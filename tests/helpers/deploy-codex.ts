@@ -153,7 +153,7 @@ export async function createPackagingFixture() {
   const dist = join(root, "dist")
   await writeFixture(
     join(codexHome, "config.toml"),
-    '[model_providers.copilot]\nbase_url = "http://localhost:4141/v1"\n',
+    `[model_providers.copilot]\nbase_url = "http://localhost:4141/v1"\nsupport_path = "${home}/.orca/hooks"\n`,
   )
   await writeFixture(join(codexHome, "auth.json"), '{"auth_mode":"apikey"}\n')
   await writeFixture(join(codexHome, "hooks.json"), '{"hooks":{}}\n')
@@ -203,5 +203,11 @@ export async function extractAndHashGeneratedArchives(out: string) {
   const zipRoot = join(zipDir, (await readdir(zipDir))[0])
   const tarHashes = await treeHashes(tarRoot)
   const zipHashes = await treeHashes(zipRoot)
-  return { files: Object.keys(tarHashes), tarHashes, zipHashes }
+  return {
+    files: Object.keys(tarHashes),
+    tarHashes,
+    tarRoot,
+    zipHashes,
+    zipRoot,
+  }
 }
