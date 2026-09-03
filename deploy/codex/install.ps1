@@ -56,6 +56,17 @@ function Test-Port([int]$PortNumber) {
   }
 }
 
+function Wait-ApiReady([int]$PortNumber, [int]$Attempts = 120) {
+  for ($attempt = 0; $attempt -lt $Attempts; $attempt++) {
+    try {
+      $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$PortNumber/" -TimeoutSec 2
+      if ($response.StatusCode -eq 200) { return $true }
+    } catch {}
+    Start-Sleep -Milliseconds 250
+  }
+  return $false
+}
+
 function Get-PortOwner([int]$PortNumber) {
   if (-not (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue)) { return $null }
   return Get-NetTCPConnection -State Listen -LocalPort $PortNumber -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -224,6 +235,7 @@ function Restore-Installation {
   if ($PreviousRunning) {
     if ($PreviousSupervisor -eq "scheduled-task") { & schtasks.exe /Run /TN $TaskName 2>$null | Out-Null }
     elseif ($PreviousSupervisor -eq "controller" -and (Test-Path $Ctl)) { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Ctl start | Out-Null }
+    if (-not (Wait-ApiReady $Port)) { Write-Warning "Previous service was restored but did not become ready on port $Port" }
   }
 }
 
@@ -304,14 +316,7 @@ try {
   if ($LASTEXITCODE -ne 0) { throw "Failed to start Copilot API" }
 
   Write-Step "Verify installation"
-  $ready = $false
-  for ($attempt = 0; $attempt -lt 120; $attempt++) {
-    try {
-      $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$Port/" -TimeoutSec 2
-      if ($response.StatusCode -eq 200) { $ready = $true; break }
-    } catch { Start-Sleep -Milliseconds 250 }
-  }
-  if (-not $ready) { throw "API did not start on port $Port" }
+  if (-not (Wait-ApiReady $Port)) { throw "API did not start on port $Port" }
   $processRecord = Get-Content (Join-Path $Share "run.pid") -Raw | ConvertFrom-Json
   $verifyArguments = @((Join-Path $Share "lib\verify-service.mjs"), "--base-url", "http://127.0.0.1:$Port", "--managed-root", $Share, "--node-path", $Node, "--process-id", [string]$processRecord.Pid)
   if ($Offline) { $verifyArguments += "--offline" }

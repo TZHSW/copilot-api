@@ -270,6 +270,20 @@ describe("portable Linux installer validation and recovery", () => {
     }
     expect((await runInstaller(environment)).exitCode).toBe(0)
 
+    const installedMain = join(
+      fixture.installRoot,
+      ".local/share/copilot-api-patched/dist/main.js",
+    )
+    const previousMain = await readFile(installedMain, "utf8")
+    expect(previousMain).toContain("server.listen(port)")
+    await writeFile(
+      installedMain,
+      previousMain.replace(
+        "server.listen(port)",
+        "setTimeout(() => server.listen(port), 2500)",
+      ),
+    )
+
     const failedUpgrade = await runInstaller({
       ...environment,
       INSTALL_FAIL_AFTER_STOP: "1",

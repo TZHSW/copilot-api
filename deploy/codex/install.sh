@@ -89,6 +89,16 @@ port_answers() {
   curl -sf --noproxy '*' --max-time 2 "http://127.0.0.1:$PORT/" >/dev/null 2>&1
 }
 
+wait_for_port() {
+  local attempts=${1:-120}
+  local _
+  for _ in $(seq 1 "$attempts"); do
+    if port_answers; then return 0; fi
+    sleep 0.25
+  done
+  return 1
+}
+
 process_is_managed() {
   local pid=$1
   local command_line
@@ -185,6 +195,9 @@ rollback() {
   fi
   if [ "$PREVIOUS_SUPERVISOR" = nohup ] && [ -x "$CTL" ]; then
     "$CTL" start >/dev/null 2>&1 || true
+  fi
+  if [ "$PREVIOUS_RUNNING" -eq 1 ] && ! wait_for_port 120; then
+    warn "旧服务已恢复，但未能在端口 $PORT 上就绪"
   fi
   exit "$status"
 }
@@ -417,12 +430,7 @@ else
 fi
 
 say "验证本地安装"
-READY=0
-for _ in $(seq 1 120); do
-  if port_answers; then READY=1; break; fi
-  sleep 0.25
-done
-[ "$READY" -eq 1 ] || die "服务未能在端口 $PORT 启动"
+wait_for_port 120 || die "服务未能在端口 $PORT 启动"
 if [ "$ACTIVE_SUPERVISOR" = systemd ]; then
   VERIFY_PID=$(systemctl --user show copilot-api.service -p MainPID --value)
 else
