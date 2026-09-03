@@ -55,6 +55,14 @@ printf '插件文件: %s\n' "$(find "$CODEX_HOME/plugins" -type f 2>/dev/null | 
 heading "能力验证"
 if [ -f "$SHARE/lib/verify-service.mjs" ] && command -v node >/dev/null 2>&1; then
   args=(--base-url "http://127.0.0.1:$PORT" --managed-root "$SHARE")
+  VERIFY_PID=""
+  if [ -s "$SHARE/run.pid" ]; then read -r VERIFY_PID _ <"$SHARE/run.pid"; fi
+  if [ -z "$VERIFY_PID" ] && command -v systemctl >/dev/null 2>&1; then
+    VERIFY_PID=$(systemctl --user show copilot-api.service -p MainPID --value 2>/dev/null || true)
+  fi
+  if [[ "$VERIFY_PID" =~ ^[0-9]+$ ]] && [ "$VERIFY_PID" -gt 0 ]; then
+    args+=(--node-path "$(command -v node)" --process-id "$VERIFY_PID")
+  fi
   if [ "$OFFLINE" = 1 ]; then args+=(--offline); fi
   node "$SHARE/lib/verify-service.mjs" "${args[@]}"
   VERIFY_STATUS=$?

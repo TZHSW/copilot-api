@@ -25,6 +25,8 @@ $BackupRoot = if ($BackupDir) { $BackupDir } else { $DefaultBackupRoot }
 $Backup = Join-Path $BackupRoot ((Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ") + "-" + $PID)
 $Mutated = $false
 $PreviousRunning = $false
+$PreviousSupervisor = "none"
+$PreviousTask = $null
 
 function Write-Step([string]$Message) {
   Write-Host "`n==> $Message" -ForegroundColor Cyan
@@ -220,8 +222,8 @@ function Restore-Installation {
   $taskXml = Join-Path $Backup "scheduled-task.xml"
   if (Test-Path $taskXml) { & schtasks.exe /Create /TN $TaskName /XML $taskXml /F | Out-Null }
   if ($PreviousRunning) {
-    if (Test-Path $Ctl) { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Ctl start | Out-Null }
-    else { & schtasks.exe /Run /TN $TaskName 2>$null | Out-Null }
+    if ($PreviousSupervisor -eq "scheduled-task") { & schtasks.exe /Run /TN $TaskName 2>$null | Out-Null }
+    elseif ($PreviousSupervisor -eq "controller" -and (Test-Path $Ctl)) { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Ctl start | Out-Null }
   }
 }
 
@@ -239,6 +241,7 @@ foreach ($required in @("dist\main.js", "lib\migrate-config.mjs", "lib\verify-se
   if (-not (Test-Path (Join-Path $PackageRoot $required))) { throw "Missing package file: $required" }
 }
 Verify-Manifest
+$PreviousTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 
 $owner = Get-PortOwner $Port
 if ($owner) {
@@ -246,6 +249,9 @@ if ($owner) {
     throw "Port $Port is owned by an unmanaged process (pid $($owner.OwningProcess)); refusing to stop it"
   }
   $PreviousRunning = $true
+  if ($PreviousTask) { $PreviousSupervisor = "scheduled-task" }
+  elseif (Test-Path $Ctl) { $PreviousSupervisor = "controller" }
+  else { throw "Existing managed API has no identifiable scheduled task or controller; refusing upgrade" }
 } elseif (Test-Port $Port) {
   throw "Port $Port answers but its owner cannot be verified; refusing to replace it"
 }
@@ -306,7 +312,8 @@ try {
     } catch { Start-Sleep -Milliseconds 250 }
   }
   if (-not $ready) { throw "API did not start on port $Port" }
-  $verifyArguments = @((Join-Path $Share "lib\verify-service.mjs"), "--base-url", "http://127.0.0.1:$Port", "--managed-root", $Share)
+  $processRecord = Get-Content (Join-Path $Share "run.pid") -Raw | ConvertFrom-Json
+  $verifyArguments = @((Join-Path $Share "lib\verify-service.mjs"), "--base-url", "http://127.0.0.1:$Port", "--managed-root", $Share, "--node-path", $Node, "--process-id", [string]$processRecord.Pid)
   if ($Offline) { $verifyArguments += "--offline" }
   & $Node $verifyArguments
   if ($LASTEXITCODE -ne 0) { throw "Service verification failed" }

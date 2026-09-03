@@ -48,6 +48,13 @@ Write-Heading "Capability verification"
 $verifier = Join-Path $Share "lib\verify-service.mjs"
 if (Test-Path $verifier) {
   $arguments = @($verifier, "--base-url", "http://127.0.0.1:$Port", "--managed-root", $Share)
+  $pidFile = Join-Path $Share "run.pid"
+  if (Test-Path $pidFile) {
+    try {
+      $record = Get-Content $pidFile -Raw | ConvertFrom-Json
+      $arguments += @("--node-path", (Get-Command node).Source, "--process-id", [string]$record.Pid)
+    } catch { Write-Warning "Cannot read managed process identity: $($_.Exception.Message)" }
+  }
   if ($Offline) { $arguments += "--offline" }
   & node $arguments
 } else {

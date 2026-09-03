@@ -1,6 +1,7 @@
 // @ts-check
 
-import { stat } from "node:fs/promises"
+import { execFileSync } from "node:child_process"
+import { readFile, readlink, realpath, stat } from "node:fs/promises"
 import { join, resolve } from "node:path"
 
 const EXPECTED_MODEL = "gpt-5.6-sol"
@@ -118,14 +119,78 @@ function asRecord(value) {
 
 /**
  * @param {object} options
+ * @param {string} options.main
+ * @param {string} options.nodePath
+ * @param {number} options.port
+ * @param {number} options.processId
+ */
+async function verifyManagedProcess({ main, nodePath, port, processId }) {
+  if (!Number.isInteger(processId) || processId < 1) {
+    throw new Error("managed process id is invalid")
+  }
+  if (process.platform === "win32") {
+    const script = `$p=Get-CimInstance Win32_Process -Filter 'ProcessId = ${processId}'; if(-not $p){exit 3}; @{ExecutablePath=$p.ExecutablePath;CommandLine=$p.CommandLine}|ConvertTo-Json -Compress`
+    const output = execFileSync(
+      "powershell.exe",
+      ["-NoProfile", "-Command", script],
+      {
+        encoding: "utf8",
+      },
+    )
+    const details = asRecord(/** @type {unknown} */ (JSON.parse(output)))
+    if (
+      String(details.ExecutablePath).toLowerCase()
+      !== resolve(nodePath).toLowerCase()
+    ) {
+      throw new Error("managed process executable does not match Node")
+    }
+    const commandLine = String(details.CommandLine)
+    if (
+      !commandLine.includes(main)
+      || !commandLine.includes(" start ")
+      || !commandLine.includes("--account-type enterprise")
+      || !commandLine.includes(`--port ${port}`)
+    ) {
+      throw new Error("managed process command line does not match deployment")
+    }
+    return
+  }
+
+  const [actualNode, expectedNode, commandLine] = await Promise.all([
+    readlink(`/proc/${processId}/exe`),
+    realpath(resolve(nodePath)),
+    readFile(`/proc/${processId}/cmdline`),
+  ])
+  if (resolve(actualNode) !== resolve(expectedNode)) {
+    throw new Error("managed process executable does not match Node")
+  }
+  const arguments_ = commandLine.toString("utf8").split("\0")
+  if (
+    arguments_[1] !== main
+    || arguments_[2] !== "start"
+    || arguments_[3] !== "--account-type"
+    || arguments_[4] !== "enterprise"
+    || arguments_[5] !== "--port"
+    || arguments_[6] !== String(port)
+  ) {
+    throw new Error("managed process command line does not match deployment")
+  }
+}
+
+/**
+ * @param {object} options
  * @param {string} options.baseUrl
  * @param {typeof globalThis.fetch} [options.fetch]
  * @param {string} [options.managedRoot]
+ * @param {string} [options.nodePath]
+ * @param {number} [options.processId]
  */
 export async function verifyLocal({
   baseUrl,
   fetch: fetchImplementation = globalThis.fetch,
   managedRoot,
+  nodePath,
+  processId,
 }) {
   const root = normalizeBaseUrl(baseUrl)
   /** @type {Record<string, unknown>} */
@@ -168,9 +233,17 @@ export async function verifyLocal({
 
   if (managedRoot) {
     try {
-      const entry = await stat(join(resolve(managedRoot), "dist", "main.js"))
-      checks.managedRoot = { ok: entry.isFile() }
-      if (!entry.isFile()) return { checks, ok: false }
+      const main = join(resolve(managedRoot), "dist", "main.js")
+      const entry = await stat(main)
+      if (!entry.isFile()) throw new Error("managed main.js is not a file")
+      if (!nodePath || !processId) {
+        throw new Error("managed process identity was not provided")
+      }
+      const url = new URL(root)
+      const port = Number(url.port || (url.protocol === "https:" ? 443 : 80))
+      await verifyManagedProcess({ main, nodePath, port, processId })
+      checks.managedRoot = { ok: true }
+      checks.managedProcess = { ok: true, processId }
     } catch (error) {
       checks.managedRoot = { message: errorMessage(error), ok: false }
       return { checks, ok: false }
@@ -418,7 +491,9 @@ function isConnectivityError(error) {
  * @param {string} options.baseUrl
  * @param {typeof globalThis.fetch} [options.fetch]
  * @param {string} [options.managedRoot]
+ * @param {string} [options.nodePath]
  * @param {boolean} [options.offline]
+ * @param {number} [options.processId]
  */
 export async function runVerification(options) {
   const local = await verifyLocal(options)
@@ -461,7 +536,7 @@ export async function runVerification(options) {
 
 /** @param {Array<string>} args */
 function parseArguments(args) {
-  /** @type {{ baseUrl?: string, managedRoot?: string, offline?: boolean }} */
+  /** @type {{ baseUrl?: string, managedRoot?: string, nodePath?: string, offline?: boolean, processId?: number }} */
   const options = { offline: false }
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index]
@@ -469,19 +544,39 @@ function parseArguments(args) {
       options.offline = true
       continue
     }
-    if (argument !== "--base-url" && argument !== "--managed-root") {
+    if (
+      argument !== "--base-url"
+      && argument !== "--managed-root"
+      && argument !== "--node-path"
+      && argument !== "--process-id"
+    ) {
       throw new Error(`unknown argument: ${argument}`)
     }
     const value = args[index + 1]
     if (!value || value.startsWith("--")) {
       throw new Error(`missing value for ${argument}`)
     }
-    if (argument === "--base-url") options.baseUrl = value
-    else options.managedRoot = value
+    switch (argument) {
+      case "--base-url": {
+        options.baseUrl = value
+        break
+      }
+      case "--managed-root": {
+        options.managedRoot = value
+        break
+      }
+      case "--node-path": {
+        options.nodePath = value
+        break
+      }
+      default: {
+        options.processId = Number(value)
+      }
+    }
     index += 1
   }
   if (!options.baseUrl) throw new Error("missing --base-url")
-  return /** @type {{ baseUrl: string, managedRoot?: string, offline?: boolean }} */ (
+  return /** @type {{ baseUrl: string, managedRoot?: string, nodePath?: string, offline?: boolean, processId?: number }} */ (
     options
   )
 }

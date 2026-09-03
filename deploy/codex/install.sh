@@ -26,6 +26,7 @@ PREVIOUS_RUNNING=0
 PREVIOUS_UNIT_ACTIVE=0
 PREVIOUS_UNIT_ENABLED=0
 PREVIOUS_UNIT_EXISTS=0
+PREVIOUS_SUPERVISOR=none
 MUTATED=0
 
 say() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
@@ -181,7 +182,8 @@ rollback() {
     else
       systemctl --user disable --now copilot-api.service >/dev/null 2>&1 || true
     fi
-  elif [ "$PREVIOUS_RUNNING" -eq 1 ] && [ -x "$CTL" ]; then
+  fi
+  if [ "$PREVIOUS_SUPERVISOR" = nohup ] && [ -x "$CTL" ]; then
     "$CTL" start >/dev/null 2>&1 || true
   fi
   exit "$status"
@@ -350,6 +352,16 @@ if host_systemd_allowed && have_user_systemd; then
   systemctl --user is-active copilot-api.service >/dev/null 2>&1 \
     && PREVIOUS_UNIT_ACTIVE=1
 fi
+if [ "$PREVIOUS_RUNNING" -eq 1 ]; then
+  if [ "$PREVIOUS_UNIT_ACTIVE" -eq 1 ] \
+    && [ "$(systemctl --user show copilot-api.service -p MainPID --value 2>/dev/null || true)" = "$BUSY_PID" ]; then
+    PREVIOUS_SUPERVISOR=systemd
+  elif [ -x "$CTL" ] && "$CTL" status >/dev/null 2>&1; then
+    PREVIOUS_SUPERVISOR=nohup
+  else
+    die "端口上的旧 API 无法归属到 systemd 或 copilot-api-ctl；拒绝升级"
+  fi
+fi
 
 trap rollback ERR INT TERM
 MUTATED=1
@@ -411,7 +423,12 @@ for _ in $(seq 1 120); do
   sleep 0.25
 done
 [ "$READY" -eq 1 ] || die "服务未能在端口 $PORT 启动"
-VERIFY_ARGS=(--base-url "http://127.0.0.1:$PORT" --managed-root "$SHARE")
+if [ "$ACTIVE_SUPERVISOR" = systemd ]; then
+  VERIFY_PID=$(systemctl --user show copilot-api.service -p MainPID --value)
+else
+  read -r VERIFY_PID _ <"$SHARE/run.pid"
+fi
+VERIFY_ARGS=(--base-url "http://127.0.0.1:$PORT" --managed-root "$SHARE" --node-path "$NODE_BIN" --process-id "$VERIFY_PID")
 if [ "$OFFLINE" = 1 ]; then VERIFY_ARGS+=(--offline); fi
 "$NODE_BIN" "$SHARE/lib/verify-service.mjs" "${VERIFY_ARGS[@]}"
 if [ "$ACTIVE_SUPERVISOR" = nohup ]; then install_cron_reboot; fi

@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test"
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { pathToFileURL } from "node:url"
 import { fetch as undiciFetch } from "undici"
 
@@ -14,7 +17,10 @@ interface VerifierModule {
   runVerification: (options: {
     baseUrl: string
     fetch?: typeof globalThis.fetch
+    managedRoot?: string
+    nodePath?: string
     offline?: boolean
+    processId?: number
   }) => Promise<VerificationResult>
   verifyCompaction: (options: {
     baseUrl: string
@@ -106,6 +112,37 @@ describe("portable service local verification", () => {
         expect(result.checks.models).toMatchObject({ ok: false })
       },
     )
+  })
+
+  test("rejects a managed PID whose executable is not the configured Node", async () => {
+    const managedRoot = await mkdtemp(join(tmpdir(), "managed-api-"))
+    await mkdir(join(managedRoot, "dist"))
+    await writeFile(join(managedRoot, "dist/main.js"), "fixture")
+    const unrelated = Bun.spawn(["sleep", "30"])
+    try {
+      await withServer(
+        (request) =>
+          localRoute(request) ?? new Response("unexpected", { status: 500 }),
+        async (baseUrl) => {
+          const result = await verifier.runVerification({
+            baseUrl,
+            fetch: nativeFetch,
+            managedRoot,
+            nodePath: process.execPath,
+            offline: true,
+            processId: unrelated.pid,
+          })
+
+          expect(result.status).toBe("failed")
+          expect(result.exitCode).toBe(2)
+          expect(result.checks.managedRoot).toMatchObject({ ok: false })
+          expect(unrelated.exitCode).toBeNull()
+        },
+      )
+    } finally {
+      unrelated.kill()
+      await unrelated.exited
+    }
   })
 })
 
