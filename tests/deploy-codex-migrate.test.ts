@@ -59,6 +59,8 @@ describe("Codex configuration transformation", () => {
     const input = `model = "gpt-5.6-sol"
 [model_providers.copilot]
 base_url = "http://localhost:4141/v1"
+env_key = "COPILOT_API_KEY"
+env_key_fallback = "dummy"
 [projects."/home/source/project"]
 trust_level = "trusted"
 [mcp_servers.copilotApi]
@@ -74,6 +76,8 @@ trusted_hash = "old"
     })
 
     expect(output).toContain('base_url = "http://localhost:5151/v1"')
+    expect(output).toContain('experimental_bearer_token = "dummy"')
+    expect(output).not.toContain("env_key")
     expect(output).toContain('url = "http://localhost:5151/mcp"')
     expect(output).not.toContain("[projects.")
     expect(output).not.toContain("[hooks.state.")

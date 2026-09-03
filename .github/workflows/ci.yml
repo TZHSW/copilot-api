@@ -90,6 +90,9 @@ jobs:
           Set-Content -LiteralPath $database -Value "live database"
           $databaseStream = [IO.File]::Open($database, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
           .\deploy\codex\install.ps1 -PackageRoot $package -InstallRoot $target -CodexHome "$target\.codex" -Port 54142 -Offline -NoScheduledTask
+          $installedConfig = Get-Content -LiteralPath "$target\.codex\config.toml" -Raw
+          if ($installedConfig -notmatch 'experimental_bearer_token\s*=\s*"dummy"') { throw "installer did not write the inline bearer token" }
+          if ($installedConfig -match '(?m)^\s*env_key\s*=') { throw "installer retained the COPILOT_API_KEY dependency" }
           if (-not (Test-Path -LiteralPath $deepCache)) { throw "installer removed transient Codex cache" }
           if (-not (Test-Path -LiteralPath $database)) { throw "installer removed Codex database" }
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ctl status
