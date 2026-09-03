@@ -73,6 +73,8 @@ jobs:
         run: |
           $package = Join-Path $env:RUNNER_TEMP "portable package"
           $target = Join-Path $env:RUNNER_TEMP "portable target"
+          $bin = Join-Path $env:RUNNER_TEMP "fixture-bin"
+          $env:PATH = "$bin;$env:PATH"
           $ctl = Join-Path $target "AppData\Local\Programs\copilot-api-ctl.ps1"
           .\deploy\codex\install.ps1 -PackageRoot $package -InstallRoot $target -CodexHome "$target\.codex" -Port 54142 -Offline -NoScheduledTask
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ctl status
