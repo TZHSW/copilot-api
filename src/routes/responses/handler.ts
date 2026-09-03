@@ -13,6 +13,11 @@ import {
 
 const RESPONSES_PATH = /^\/(?:v1\/)?responses/
 const UNSUPPORTED_OPTIONAL_TOOLS = new Set(["image_generation"])
+const FAST_SERVICE_TIERS = new Set(["fast", "priority"])
+const FAST_MODEL_ALIASES = new Map([
+  ["gpt-5.6-sol", "gpt-5.6-sol-fast"],
+  ["gpt-5.6-sol-fast", "gpt-5.6-sol-fast"],
+])
 const textDecoder = new TextDecoder()
 
 export async function decodeResponsesRequestBody(
@@ -36,11 +41,25 @@ export function prepareResponsesPayload(payload: ResponsesPayload): {
   payload: ResponsesPayload
   removedToolTypes: Array<string>
 } {
-  if (!Array.isArray(payload.tools)) {
-    return { payload, removedToolTypes: [] }
+  let preparedPayload = payload
+  const fastModel = FAST_MODEL_ALIASES.get(payload.model)
+  if (
+    typeof payload.service_tier === "string"
+    && FAST_SERVICE_TIERS.has(payload.service_tier)
+    && fastModel
+  ) {
+    const { service_tier: _serviceTier, ...rest } = payload
+    preparedPayload = {
+      ...rest,
+      model: fastModel,
+    }
   }
 
-  const toolChoice = payload.tool_choice
+  if (!Array.isArray(preparedPayload.tools)) {
+    return { payload: preparedPayload, removedToolTypes: [] }
+  }
+
+  const toolChoice = preparedPayload.tool_choice
   const explicitlySelectedType =
     (
       typeof toolChoice === "object"
@@ -50,7 +69,7 @@ export function prepareResponsesPayload(payload: ResponsesPayload): {
       (toolChoice as { type: string }).type
     : undefined
   const removedToolTypes: Array<string> = []
-  const tools = (payload.tools as Array<unknown>).filter((tool) => {
+  const tools = (preparedPayload.tools as Array<unknown>).filter((tool) => {
     if (typeof tool !== "object" || tool === null) return true
     const type = (tool as { type?: unknown }).type
     if (typeof type !== "string") return true
@@ -65,7 +84,7 @@ export function prepareResponsesPayload(payload: ResponsesPayload): {
   })
 
   return {
-    payload: { ...payload, tools },
+    payload: { ...preparedPayload, tools },
     removedToolTypes,
   }
 }

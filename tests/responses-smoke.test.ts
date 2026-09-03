@@ -62,6 +62,49 @@ test("forwards POST to /responses and returns body as-is", async () => {
   expect(result.output).toHaveLength(1)
 })
 
+test.each(["fast", "priority"])(
+  "maps the %s service tier to Copilot's internal fast model",
+  (serviceTier) => {
+    const prepared = prepareResponsesPayload({
+      model: "gpt-5.6-sol",
+      input: "test",
+      service_tier: serviceTier,
+    })
+
+    expect(prepared.payload).toEqual({
+      model: "gpt-5.6-sol-fast",
+      input: "test",
+    })
+  },
+)
+
+test("leaves standard model requests unchanged", () => {
+  const withoutTier = {
+    model: "gpt-5.6-sol",
+    input: "test",
+  }
+  const defaultTier = {
+    ...withoutTier,
+    service_tier: "default",
+  }
+
+  expect(prepareResponsesPayload(withoutTier).payload).toBe(withoutTier)
+  expect(prepareResponsesPayload(defaultTier).payload).toBe(defaultTier)
+})
+
+test("removes the service tier from an explicit Copilot fast model", () => {
+  const prepared = prepareResponsesPayload({
+    model: "gpt-5.6-sol-fast",
+    input: "test",
+    service_tier: "priority",
+  })
+
+  expect(prepared.payload).toEqual({
+    model: "gpt-5.6-sol-fast",
+    input: "test",
+  })
+})
+
 test("preserves future tool types while dropping optional image generation", () => {
   const prepared = prepareResponsesPayload({
     model: "gpt-5.6-sol",
