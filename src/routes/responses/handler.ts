@@ -11,6 +11,10 @@ import {
   type ResponsesPayload,
 } from "~/services/copilot/create-responses"
 
+import {
+  bridgeCollaborationRequest,
+  bridgeCollaborationBody,
+} from "./collaboration-bridge"
 import { quarantineToolOutputs } from "./quarantine-output"
 
 const RESPONSES_PATH = /^\/(?:v1\/)?responses/
@@ -100,6 +104,7 @@ export async function handleResponses(c: Context) {
   const hasBody = !["DELETE", "GET", "HEAD"].includes(c.req.method)
   let payload: ResponsesPayload | undefined
   let quarantinedOutputs: Array<string> = []
+  let plaintextCollaboration = false
 
   if (hasBody) {
     let rawBody: string
@@ -144,6 +149,11 @@ export async function handleResponses(c: Context) {
       )
       payload = recovery.payload
       quarantinedOutputs = recovery.quarantined
+      if (process.env.COPILOT_PLAINTEXT_COLLABORATION === "true") {
+        const bridge = bridgeCollaborationRequest(payload)
+        payload = bridge.payload
+        plaintextCollaboration = bridge.active
+      }
       if (quarantinedOutputs.length > 0) {
         consola.warn(
           `Quarantined explicitly configured encrypted tool output(s): ${quarantinedOutputs.join(", ")}`,
@@ -180,7 +190,12 @@ export async function handleResponses(c: Context) {
     )
   }
 
-  return new Response(response.body, {
+  const body =
+    plaintextCollaboration ?
+      await bridgeCollaborationBody(response, headers)
+    : response.body
+
+  return new Response(body, {
     status: response.status,
     statusText: response.statusText,
     headers,

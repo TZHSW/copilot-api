@@ -362,6 +362,25 @@ never edited. Unlisted ciphertext, reasoning, and compaction remain unchanged.
 This option is disabled by default; it does not decrypt or recover the message.
 Remove the fingerprints after the upstream issue is resolved.
 
+For Codex multi-agent v2 on Copilot, enable
+`COPILOT_PLAINTEXT_COLLABORATION=true` to prevent new encrypted-message replay
+failures. Copilot reserves the `collaboration` tool namespace and requires its
+message arguments to use encryption. Those ciphertexts have been observed to
+become unreadable on later requests. The bridge advertises the same tools as
+`codex_collaboration_plaintext` upstream, turns off encryption only for the
+`message` argument of `spawn_agent`, `send_message`, and `followup_task`, and
+restores the original namespace in responses. It explicitly supplies
+`encrypted_function_args: []`, which tells Codex to retain and relay normal
+message text. Tool execution still happens in Codex. Messages remain protected
+by HTTPS in transit but are readable in the local conversation history.
+
+This handles standard Responses and Responses Lite `additional_tools`, JSON
+and SSE responses, and historical function-call namespace replay. It preserves
+reasoning and compaction encryption. Existing unreadable ciphertext cannot be
+recovered by this bridge; the explicit fingerprint quarantine above remains
+available for those old records. A bridged response is identified by
+`x-copilot-collaboration-mode: plaintext`.
+
 Register Copilot's read-only MCP endpoint to expose web search and GitHub tools
 to Codex:
 
