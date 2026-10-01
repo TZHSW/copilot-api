@@ -1,4 +1,5 @@
 import { beforeEach, expect, mock, test } from "bun:test"
+import { createHash } from "node:crypto"
 
 import { state } from "../src/lib/state"
 import { prepareResponsesPayload } from "../src/routes/responses/handler"
@@ -313,4 +314,58 @@ test("returns an OpenAI-shaped error for malformed JSON", async () => {
       type: "invalid_request_error",
     },
   })
+})
+
+test("applies only configured quarantine and exposes recovery in response metadata", async () => {
+  const originalSetting = process.env.COPILOT_QUARANTINED_OUTPUT_SHA256
+  const setFingerprints = (value: string | undefined) => {
+    if (value === undefined) {
+      delete process.env.COPILOT_QUARANTINED_OUTPUT_SHA256
+    } else {
+      process.env.COPILOT_QUARANTINED_OUTPUT_SHA256 = value
+    }
+  }
+  const ciphertext = "confirmed-unreadable-message"
+  const fingerprint = createHash("sha256").update(ciphertext).digest("hex")
+  const payload = {
+    model: "gpt-6-astra",
+    input: [
+      {
+        type: "function_call_output",
+        call_id: "call_1",
+        output: [{ type: "encrypted_content", encrypted_content: ciphertext }],
+      },
+    ],
+  }
+  const request = () =>
+    server.request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+  try {
+    setFingerprints(undefined)
+    const unchanged = await request()
+    expect(unchanged.headers.has("x-copilot-quarantined-output-count")).toBe(
+      false,
+    )
+    expect(JSON.parse(fetchMock.mock.calls[0][1]?.body as string)).toEqual(
+      payload,
+    )
+
+    setFingerprints(fingerprint)
+    const recovered = await request()
+    expect(recovered.status).toBe(200)
+    expect(recovered.headers.get("x-copilot-quarantined-output-count")).toBe(
+      "1",
+    )
+    const forwarded = JSON.parse(
+      fetchMock.mock.calls[1][1]?.body as string,
+    ) as typeof payload
+    expect(forwarded.input[0].output[0].type).toBe("input_text")
+    expect(JSON.stringify(forwarded)).not.toContain(ciphertext)
+    expect(payload.input[0].output[0].encrypted_content).toBe(ciphertext)
+  } finally {
+    setFingerprints(originalSetting)
+  }
 })

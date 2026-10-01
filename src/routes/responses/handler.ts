@@ -11,6 +11,8 @@ import {
   type ResponsesPayload,
 } from "~/services/copilot/create-responses"
 
+import { quarantineToolOutputs } from "./quarantine-output"
+
 const RESPONSES_PATH = /^\/(?:v1\/)?responses/
 const UNSUPPORTED_OPTIONAL_TOOLS = new Set(["image_generation"])
 const FAST_SERVICE_TIERS = new Set(["fast", "priority"])
@@ -97,6 +99,7 @@ export async function handleResponses(c: Context) {
   const path = `/responses${suffix}`
   const hasBody = !["DELETE", "GET", "HEAD"].includes(c.req.method)
   let payload: ResponsesPayload | undefined
+  let quarantinedOutputs: Array<string> = []
 
   if (hasBody) {
     let rawBody: string
@@ -130,6 +133,22 @@ export async function handleResponses(c: Context) {
 
       const prepared = prepareResponsesPayload(payload)
       payload = prepared.payload
+      const recovery = quarantineToolOutputs(
+        payload,
+        new Set(
+          (process.env.COPILOT_QUARANTINED_OUTPUT_SHA256 ?? "")
+            .split(",")
+            .map((value) => value.trim().toLowerCase())
+            .filter((value) => /^[a-f\d]{64}$/.test(value)),
+        ),
+      )
+      payload = recovery.payload
+      quarantinedOutputs = recovery.quarantined
+      if (quarantinedOutputs.length > 0) {
+        consola.warn(
+          `Quarantined explicitly configured encrypted tool output(s): ${quarantinedOutputs.join(", ")}`,
+        )
+      }
       if (prepared.removedToolTypes.length > 0) {
         consola.debug(
           `Filtered optional Copilot-incompatible tools: ${prepared.removedToolTypes.join(", ")}`,
@@ -154,6 +173,12 @@ export async function handleResponses(c: Context) {
   const headers = new Headers(response.headers)
   headers.delete("content-encoding")
   headers.delete("content-length")
+  if (quarantinedOutputs.length > 0) {
+    headers.set(
+      "x-copilot-quarantined-output-count",
+      String(quarantinedOutputs.length),
+    )
+  }
 
   return new Response(response.body, {
     status: response.status,

@@ -350,6 +350,18 @@ With `name = "OpenAI"`, automatic compaction and `/compact` use Copilot's
 encrypted remote compaction item over the normal `/v1/responses` endpoint.
 Codex's default zstd request compression is supported by the proxy.
 
+If a specific encrypted tool or subagent message repeatedly produces
+`Encrypted function output content could not be decrypted or decoded`, the
+proxy supports an explicit, lossy recovery option. Set
+`COPILOT_QUARANTINED_OUTPUT_SHA256` to the comma-separated SHA256 fingerprints
+of the confirmed bad ciphertext strings (UTF-8). Only matching encrypted blocks
+inside tool outputs or agent messages are replaced with a visible missing-content
+notice. The proxy logs the fingerprints and adds
+`x-copilot-quarantined-output-count` to the response. Saved client history is
+never edited. Unlisted ciphertext, reasoning, and compaction remain unchanged.
+This option is disabled by default; it does not decrypt or recover the message.
+Remove the fingerprints after the upstream issue is resolved.
+
 Register Copilot's read-only MCP endpoint to expose web search and GitHub tools
 to Codex:
 
