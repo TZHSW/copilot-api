@@ -68,3 +68,13 @@ Four old failing message fingerprints remain explicitly quarantined for the
 manager's existing history. This is separate from preventing new ciphertext.
 Private evidence and runtime deployment records are under
 `ICLR_workspace/output/archive/2026-10-01/copilot-encrypted-tool-output-1222/recurrence-1419/`.
+
+## Deployment result
+
+Commit `4197a4f` was deployed with the plaintext bridge enabled. All 28 targeted
+tests, TypeScript checking, ESLint, and the build passed. Production JSON and
+Responses Lite SSE calls returned plaintext arguments with the client marker;
+both subsequent replay requests retained the exact message. At 14:32:25 UTC
+the manager's original session received HTTP 200 with both the plaintext-bridge
+header and a quarantine count of four, then replied successfully. No cleanup
+or other work was started during that verification.
