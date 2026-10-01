@@ -33,3 +33,24 @@ Preparing and validating the patch did not deploy it or restart the service.
 
 Private reproduction evidence is archived under
 `ICLR_workspace/output/archive/2026-10-01/copilot-encrypted-tool-output-1222/`.
+
+## Deployment and direct upstream verification
+
+After user approval, commit `9f2d364` was deployed at 12:31:43 UTC. The service
+was restarted after observing zero established connections. The systemd drop-in
+`20-encrypted-output-quarantine.conf` lists only the fingerprint above. Sending
+all four original messages to the deployed proxy returned HTTP 200, status
+`completed`, and `x-copilot-quarantined-output-count: 1`. The original Herdr
+conversation subsequently answered the recovery-only prompt successfully.
+
+To distinguish a proxy transformation bug from an upstream failure, two minimal
+requests also bypassed the local proxy and went directly to
+`https://api.enterprise.githubcopilot.com/responses`, using the existing account
+and `gpt-6-astra`. Message 1 completed with HTTP 200; message 3 returned the same
+HTTP 400 decrypt error. The failure therefore reproduces independently of the
+local proxy. This does not establish whether the underlying upstream cause is
+an encryption-format, key, or routing problem.
+
+Deployment configuration, bundle hashes, rollback bundles, direct-request
+results, and the Herdr verification are preserved in the archive's
+`deployment/` directory. The pre-deployment diagnosis and manifest remain intact.
