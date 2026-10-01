@@ -38,6 +38,7 @@ A reverse-engineered proxy for the GitHub Copilot API that exposes it as an Open
 - **Manual Request Approval**: Manually approve or deny each API request for fine-grained control over usage (`--manual`).
 - **Token Visibility**: Option to display GitHub and Copilot tokens during authentication and refresh for debugging (`--show-token`).
 - **Flexible Authentication**: Authenticate interactively or provide a GitHub token directly, suitable for CI/CD environments.
+- **Copilot CLI OAuth Compatibility**: OAuth tokens created by Copilot CLI use the `copilot-developer-cli` CAPI integration when GitHub's legacy token exchange endpoint rejects them.
 - **Support for Different Account Types**: Works with individual, business, and enterprise GitHub Copilot plans.
 
 ## Demo

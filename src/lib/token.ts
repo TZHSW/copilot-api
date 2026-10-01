@@ -16,7 +16,27 @@ const writeGithubToken = (token: string) =>
   fs.writeFile(PATHS.GITHUB_TOKEN_PATH, token)
 
 export const setupCopilotToken = async () => {
-  const { token, refresh_in } = await getCopilotToken()
+  let response
+  try {
+    response = await getCopilotToken()
+  } catch (error) {
+    if (
+      error instanceof HTTPError
+      && error.response.status === 403
+      && state.githubToken
+    ) {
+      state.copilotToken = state.githubToken
+      state.copilotIntegrationId = "copilot-developer-cli"
+      consola.info(
+        "Copilot token exchange rejected the GitHub OAuth token; using Copilot CLI authentication",
+      )
+      return
+    }
+
+    throw error
+  }
+
+  const { token, refresh_in } = response
   state.copilotToken = token
 
   // Display the Copilot token to the screen

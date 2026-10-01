@@ -3,6 +3,7 @@ import type { ModelsResponse } from "~/services/copilot/get-models"
 export interface State {
   githubToken?: string
   copilotToken?: string
+  copilotIntegrationId: string
 
   accountType: string
   models?: ModelsResponse
@@ -19,6 +20,7 @@ export interface State {
 
 export const state: State = {
   accountType: "individual",
+  copilotIntegrationId: "vscode-chat",
   manualApprove: false,
   rateLimitWait: false,
   showToken: false,
