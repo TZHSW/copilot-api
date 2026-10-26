@@ -7,7 +7,9 @@ import { state } from "~/lib/state"
 
 // Pass-through proxy. The GitHub Copilot backend natively exposes
 // `/responses` (verified against gpt-5.6-sol), so we forward the request body
-// as-is and stream the response back. We intentionally use loose typing
+// as-is and stream the response back, except for one compatibility retry when
+// the backend explicitly rejects Codex's private content item metadata.
+// We intentionally use loose typing
 // (`Record<string, unknown>`) to avoid coupling to the evolving OpenAI
 // Responses schema; the upstream is the source of truth.
 export type ResponsesPayload = Record<string, unknown> & {
@@ -20,6 +22,48 @@ interface ResponsesRequestOptions {
   path?: string
   search?: string
   signal?: AbortSignal
+}
+
+const CONTENT_METADATA_ERROR =
+  /^Unknown parameter: 'input\[(\d+)\]\.internal_chat_message_metadata_passthrough\.content_item_metadata'\.$/
+
+function withoutRejectedContentMetadata(
+  payload: ResponsesPayload,
+  body: unknown,
+): { payload: ResponsesPayload; removedItems: number } | undefined {
+  if (typeof body !== "object" || body === null || !("error" in body)) return
+  const error = body.error
+  if (typeof error !== "object" || error === null) return
+  const { code, message } = error as Record<string, unknown>
+  if (code !== "invalid_request_body" || typeof message !== "string") return
+  const match = CONTENT_METADATA_ERROR.exec(message)
+  if (!match || !Array.isArray(payload.input)) return
+
+  const removedIndices: Array<number> = []
+  const input = payload.input.map((value: unknown, index: number) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value))
+      return value
+    const item = value as Record<string, unknown>
+    const metadata = item.internal_chat_message_metadata_passthrough
+    if (
+      typeof metadata !== "object"
+      || metadata === null
+      || Array.isArray(metadata)
+      || !Object.hasOwn(metadata, "content_item_metadata")
+    )
+      return value
+    const { content_item_metadata: _removed, ...retained } = metadata as Record<
+      string,
+      unknown
+    >
+    removedIndices.push(index)
+    return { ...item, internal_chat_message_metadata_passthrough: retained }
+  })
+  if (!removedIndices.includes(Number(match[1]))) return
+  return {
+    payload: { ...payload, input },
+    removedItems: removedIndices.length,
+  }
 }
 
 export function hasResponsesVisualInput(value: unknown): boolean {
@@ -71,12 +115,32 @@ export const proxyResponses = async (
     "X-Initiator": payload ? responsesInitiator(payload) : "user",
   }
 
-  return await fetch(`${copilotBaseUrl(state)}${path}${search}`, {
-    method,
-    headers,
-    body: payload === undefined ? undefined : JSON.stringify(payload),
-    signal: options.signal,
-  })
+  const forward = (body: ResponsesPayload | undefined) =>
+    fetch(`${copilotBaseUrl(state)}${path}${search}`, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: options.signal,
+    })
+  const response = await forward(payload)
+  if (response.status !== 400 || !payload || !Array.isArray(payload.input))
+    return response
+
+  let body: unknown
+  try {
+    body = await response.clone().json()
+  } catch (error) {
+    if (error instanceof SyntaxError) return response
+    throw error
+  }
+  const retry = withoutRejectedContentMetadata(payload, body)
+  if (!retry) return response
+
+  consola.warn(
+    `Retrying Copilot Responses without rejected content_item_metadata on ${retry.removedItems} input item(s)`,
+  )
+  await response.body?.cancel()
+  return await forward(retry.payload)
 }
 
 export const createResponses = async (

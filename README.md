@@ -350,6 +350,15 @@ With `name = "OpenAI"`, automatic compaction and `/compact` use Copilot's
 encrypted remote compaction item over the normal `/v1/responses` endpoint.
 Codex's default zstd request compression is supported by the proxy.
 
+Some Copilot backends reject Codex's private
+`input[].internal_chat_message_metadata_passthrough.content_item_metadata`
+field, while others accept it. The proxy first forwards the request unchanged.
+Only when Copilot returns HTTP 400 with `invalid_request_body` explicitly
+identifying this unknown field does it retry once without that field on the
+input items. It logs the compatibility retry and preserves the remaining
+metadata, message content, encrypted data, reasoning effort, and saved client
+history. Other errors and any error from the retry are returned unchanged.
+
 If a specific encrypted tool or subagent message repeatedly produces
 `Encrypted function output content could not be decrypted or decoded`, the
 proxy supports an explicit, lossy recovery option. Set

@@ -50,6 +50,45 @@ function fetchInputUrl(input: string | URL | Request | undefined): string {
   return input?.url ?? ""
 }
 
+const rejectedContentMetadataError = {
+  error: {
+    message:
+      "Unknown parameter: 'input[1].internal_chat_message_metadata_passthrough.content_item_metadata'.",
+    code: "invalid_request_body",
+  },
+}
+
+function payloadWithContentMetadata() {
+  return {
+    model: "gpt-6-astra",
+    reasoning: { effort: "high" },
+    input: [
+      { role: "user", content: "Keep the conversation." },
+      {
+        role: "assistant",
+        content: [{ type: "output_text", text: "Previous reply." }],
+        internal_chat_message_metadata_passthrough: {
+          content_item_metadata: [{ id: "metadata_1" }],
+          retained: "keep",
+        },
+      },
+      {
+        type: "function_call_output",
+        call_id: "call_1",
+        output: [
+          {
+            type: "encrypted_content",
+            encrypted_content: "preserve-ciphertext",
+          },
+        ],
+        internal_chat_message_metadata_passthrough: {
+          content_item_metadata: [],
+        },
+      },
+    ],
+  }
+}
+
 test("forwards POST to /responses and returns body as-is", async () => {
   const result = (await createResponses({
     model: "gpt-5.6-sol",
@@ -62,6 +101,144 @@ test("forwards POST to /responses and returns body as-is", async () => {
   expect(result.object).toBe("response")
   expect(result.output).toHaveLength(1)
 })
+
+test("preserves content item metadata when the upstream accepts it", async () => {
+  const payload = payloadWithContentMetadata()
+  const response = await proxyResponses(payload)
+
+  expect(response.status).toBe(200)
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+  expect(fetchMock.mock.calls[0][1]?.body).toBe(JSON.stringify(payload))
+})
+
+test("retries rejected metadata without changing context or saved input", async () => {
+  let requests = 0
+  nextResponse = () =>
+    ++requests === 1 ?
+      Response.json(rejectedContentMetadataError, { status: 400 })
+    : Response.json({ id: "resp_retry", output: [] })
+  const payload = payloadWithContentMetadata()
+  const original = JSON.stringify(payload)
+  const controller = new AbortController()
+  const response = await proxyResponses(payload, {
+    path: "/responses",
+    search: "?beta=true",
+    signal: controller.signal,
+  })
+
+  expect(response.status).toBe(200)
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+  expect(fetchMock.mock.calls[0][1]?.body).toBe(original)
+  const [url, init] = fetchMock.mock.calls[1]
+  expect(fetchInputUrl(url).endsWith("/responses?beta=true")).toBe(true)
+  expect(init?.signal).toBe(controller.signal)
+  expect(JSON.parse(init?.body as string)).toEqual({
+    ...payload,
+    input: [
+      payload.input[0],
+      {
+        ...payload.input[1],
+        internal_chat_message_metadata_passthrough: { retained: "keep" },
+      },
+      {
+        ...payload.input[2],
+        internal_chat_message_metadata_passthrough: {},
+      },
+    ],
+  })
+  expect(JSON.stringify(payload)).toBe(original)
+})
+
+test.each([
+  {
+    status: 400,
+    error: { ...rejectedContentMetadataError.error, code: "other_error" },
+  },
+  {
+    status: 400,
+    error: {
+      ...rejectedContentMetadataError.error,
+      message: "Unknown parameter: 'input[1].other_metadata'.",
+    },
+  },
+  {
+    status: 400,
+    error: {
+      ...rejectedContentMetadataError.error,
+      message:
+        "Unknown parameter: 'input[99].internal_chat_message_metadata_passthrough.content_item_metadata'.",
+    },
+  },
+  { status: 429, error: rejectedContentMetadataError.error },
+])(
+  "preserves unrelated upstream metadata errors: %j",
+  async ({ status, error }) => {
+    nextResponse = () => Response.json({ error }, { status })
+    const response = await proxyResponses(payloadWithContentMetadata())
+
+    expect(response.status).toBe(status)
+    expect(await response.json()).toEqual({ error })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  },
+)
+
+test("preserves non-JSON upstream errors without retrying", async () => {
+  nextResponse = () => new Response("not JSON", { status: 400 })
+  const response = await proxyResponses(payloadWithContentMetadata())
+
+  expect(response.status).toBe(400)
+  expect(await response.text()).toBe("not JSON")
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+})
+
+test("limits metadata recovery to one retry and preserves its errors", async () => {
+  let requests = 0
+  nextResponse = () =>
+    ++requests === 1 ?
+      Response.json(rejectedContentMetadataError, { status: 400 })
+    : Response.json(rejectedContentMetadataError, {
+        status: 400,
+        headers: { "retry-after": "3" },
+      })
+  const response = await proxyResponses(payloadWithContentMetadata())
+
+  expect(response.status).toBe(400)
+  expect(response.headers.get("retry-after")).toBe("3")
+  expect(await response.json()).toEqual(rejectedContentMetadataError)
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+})
+
+test.each([false, true])(
+  "preserves SSE after metadata recovery, zstd=%s",
+  async (compressed) => {
+    const body = 'event: response.output_text.delta\ndata: {"delta":"OK"}\n\n'
+    let requests = 0
+    nextResponse = () =>
+      ++requests === 1 ?
+        Response.json(rejectedContentMetadataError, { status: 400 })
+      : new Response(body, {
+          headers: {
+            "content-type": "text/event-stream",
+            "x-request-id": "metadata-retry",
+          },
+        })
+    const payload = { ...payloadWithContentMetadata(), stream: true }
+    const bytes = new TextEncoder().encode(JSON.stringify(payload))
+    const response = await server.request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(compressed ? { "content-encoding": "zstd" } : {}),
+      },
+      body: compressed ? Bun.zstdCompressSync(bytes) : bytes,
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe(body)
+    expect(response.headers.get("x-request-id")).toBe("metadata-retry")
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  },
+)
 
 test.each(["fast", "priority"])(
   "maps the %s service tier to Copilot's internal fast model",
